@@ -25,6 +25,7 @@ def sport_params(sport):
         float(NB["ASCENT_MIN_LEN"]),
         float(NB["GAP_MIN_TIME"]),
         float(NB["GAP_MIN_DIST"]),
+        200.0,
     )
 
 

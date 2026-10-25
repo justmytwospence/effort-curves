@@ -5,7 +5,11 @@ use crate::prep::{Segment, Sport};
 use rayon::prelude::*;
 
 /// Metrics, in output order.
-pub const METRICS: [&str; 6] = ["p", "v", "g", "h", "a", "x"];
+/// p power (W), v speed (m/s), g net gradient, h heart rate (bpm), a vertical speed (m/s), x grade-adjusted speed (m/s),
+/// c cadence over the whole window (cycles/min, coasting and stops count as zero), k crank torque (N·m: work per
+/// radian of pedal revolution), l distance per cycle (m: step length), pc cadence while pedaling or stepping
+/// (cycles/min), ps share of the window spent pedaling or stepping (0-1)
+pub const METRICS: [&str; 11] = ["p", "v", "g", "h", "a", "x", "c", "k", "l", "pc", "ps"];
 pub const M: usize = METRICS.len();
 const P: usize = 0;
 const V: usize = 1;
@@ -13,6 +17,11 @@ const G: usize = 2;
 const H: usize = 3;
 const A: usize = 4;
 const X: usize = 5;
+const C: usize = 6;
+const K: usize = 7;
+const L: usize = 8;
+const PC: usize = 9;
+const PS: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Basis {
@@ -106,6 +115,21 @@ fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis
     } else {
         f64::NAN
     };
+    if s.crev.is_empty() {
+        for m in [C, K, L, PC, PS] {
+            out[m] = f64::NAN;
+        }
+    } else {
+        let rev = s.crev[j] - s.crev[i];
+        let ped = s.cped[j] - s.cped[i];
+        out[C] = rev / dt * 60.0;
+        out[PS] = ped / dt;
+        // cadence while pedaling needs enough pedaling to mean something
+        out[PC] = if ped >= 5f64.max(0.25 * dt) { rev / ped * 60.0 } else { f64::NAN };
+        let enough = rev >= 1.0;
+        out[K] = if enough && !s.cp.is_empty() { (s.cp[j] - s.cp[i]) / (2.0 * std::f64::consts::PI * rev) } else { f64::NAN };
+        out[L] = if enough { dd / rev } else { f64::NAN };
+    }
 }
 
 #[inline]

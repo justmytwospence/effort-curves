@@ -138,10 +138,11 @@ impl Prepared {
 ///
 /// offsets has len(activity_ids) + 1 entries delimiting each activity's samples. t is seconds into the
 /// activity (unique per activity). NaN marks a missing value. gap: 71 grade-adjustment factors for
-/// -35..+35 % gradient, or None. hr_bridge: longest stretch without a heart-rate reading (s) that is
+/// -35..+35 % gradient, or None. sport: (speed cap, grade cap, ascent cap, ascent min length, GAP min time,
+/// GAP min distance, cadence cap). cadence: cycles per minute per sample (pedal revolutions or steps). hr_bridge: longest stretch without a heart-rate reading (s) that is
 /// interpolated.
 #[pyfunction]
-#[pyo3(signature = (activity_ids, offsets, t, dist, alt, power, hr, indoor, powered, sport, gap=None, hr_bridge=600))]
+#[pyo3(signature = (activity_ids, offsets, t, dist, alt, power, hr, indoor, powered, sport, gap=None, hr_bridge=600, cadence=None))]
 #[allow(clippy::too_many_arguments)]
 fn prepare<'py>(
     py: Python<'py>,
@@ -154,9 +155,10 @@ fn prepare<'py>(
     hr: PyReadonlyArray1<'py, f64>,
     indoor: PyReadonlyArray1<'py, u8>,
     powered: PyReadonlyArray1<'py, u8>,
-    sport: (f64, f64, f64, f64, f64, f64),
+    sport: (f64, f64, f64, f64, f64, f64, f64),
     gap: Option<PyReadonlyArray1<'py, f64>>,
     hr_bridge: usize,
+    cadence: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Prepared> {
     let ids = activity_ids.as_slice()?.to_vec();
     let off = offsets.as_slice()?;
@@ -165,6 +167,18 @@ fn prepare<'py>(
     }
     let (t, dist, alt, pw, hr) = (t.as_slice()?, dist.as_slice()?, alt.as_slice()?, power.as_slice()?, hr.as_slice()?);
     let (indoor, powered) = (indoor.as_slice()?, powered.as_slice()?);
+    // cadence in cycles per minute (pedal revolutions, or steps); absent means none recorded
+    let no_cad;
+    let cad: &[f64] = match &cadence {
+        Some(c) => c.as_slice()?,
+        None => {
+            no_cad = vec![f64::NAN; t.len()];
+            &no_cad
+        }
+    };
+    if cad.len() != t.len() {
+        return Err(PyValueError::new_err("cadence must have one value per sample"));
+    }
     let gap = match &gap {
         Some(g) => {
             let g = g.as_slice()?;
@@ -182,6 +196,7 @@ fn prepare<'py>(
         ascent_min: sport.3,
         gap_min_time: sport.4,
         gap_min_dist: sport.5,
+        cadence_cap: sport.6,
     };
     let pa = Params { hr_bridge, ..Params::default() };
     let segs: Vec<Segment> = py.allow_threads(|| {
@@ -199,6 +214,7 @@ fn prepare<'py>(
                     &alt[lo..hi],
                     &pw[lo..hi],
                     &hr[lo..hi],
+                    &cad[lo..hi],
                     indoor[a] != 0,
                     powered[a] != 0,
                     gap.as_deref(),

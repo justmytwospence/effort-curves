@@ -20,6 +20,8 @@ pub struct Sport {
     /// grade-adjusted pace only for windows at least this long (s) / far (m)
     pub gap_min_time: f64,
     pub gap_min_dist: f64,
+    /// highest believable cadence (cycles per minute): a second above it counts as no pedaling or stepping
+    pub cadence_cap: f64,
 }
 
 /// Grid and smoothing parameters.
@@ -68,6 +70,10 @@ pub struct Segment {
     pub cg: Vec<f64>,
     /// cumulative grade-adjusted distance (m); empty without a model
     pub cx: Vec<f64>,
+    /// cumulative cycles (pedal revolutions or steps) and seconds spent pedaling or stepping (cadence > 0);
+    /// empty when the activity recorded no cadence
+    pub crev: Vec<f64>,
+    pub cped: Vec<f64>,
     pub has_alt: bool,
 }
 
@@ -101,6 +107,7 @@ pub fn prepare_activity(
     alt: &[f64],
     pw: &[f64],
     hr: &[f64],
+    cad: &[f64],
     indoor: bool,
     powered: bool,
     gap: Option<&[f64]>,
@@ -110,7 +117,7 @@ pub fn prepare_activity(
     if t.is_empty() || t[t.len() - 1] - t[0] < pa.min_len {
         return Vec::new();
     }
-    vec![build_segment(act, t, dist, alt, pw, hr, indoor, powered, gap, sp, pa)]
+    vec![build_segment(act, t, dist, alt, pw, hr, cad, indoor, powered, gap, sp, pa)]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -121,6 +128,7 @@ fn build_segment(
     alt: &[f64],
     pw: &[f64],
     hr: &[f64],
+    cad: &[f64],
     indoor: bool,
     powered: bool,
     gap: Option<&[f64]>,
@@ -134,6 +142,9 @@ fn build_segment(
     let mut p = vec![0.0; if powered { len } else { 0 }];
     let mut h = vec![0.0; len];
     let mut hn = vec![0.0; len];
+    // cadence in cycles per minute: one second adds cadence / 60 cycles; gaps and glitches add none
+    let mut cy = vec![0.0; len];
+    let mut cs = vec![0.0; len];
 
     // onto the grid: distance and altitude interpolated across gaps (the elapsed time counts, the
     // movement is spread over it); power and heart rate only from current samples
@@ -167,6 +178,11 @@ fn build_segment(
         if fresh {
             if powered && !pw[ptr].is_nan() {
                 p[g] = pw[ptr];
+            }
+            let c = cad[ptr];
+            if c > 0.0 && c <= sp.cadence_cap {
+                cy[g] = c / 60.0;
+                cs[g] = 1.0;
             }
             let v = hr[ptr];
             if (30.0..=230.0).contains(&v) {
@@ -270,6 +286,8 @@ fn build_segment(
         cd,
         cp: if powered { cumsum(&p) } else { Vec::new() },
         ch: cumsum(&h),
+        crev: if cs.iter().any(|&x| x > 0.0) { cumsum(&cy) } else { Vec::new() },
+        cped: if cs.iter().any(|&x| x > 0.0) { cumsum(&cs) } else { Vec::new() },
         chn: cumsum(&hn),
         ca,
         cg,

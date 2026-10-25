@@ -7,8 +7,8 @@ import effort_curves as ec
 
 M = {m: i for i, m in enumerate(ec.METRICS)}
 NAN = float("nan")
-# speed cap, grade cap, ascent cap, ascent min length, GAP min time, GAP min distance
-SPORT = (7.5, 0.45, 0.5, 60.0, 180.0, 800.0)
+# speed cap, grade cap, ascent cap, ascent min length, GAP min time, GAP min distance, cadence cap
+SPORT = (7.5, 0.45, 0.5, 60.0, 180.0, 800.0, 200.0)
 
 
 def activity(rng, n, gap_at=None, gap_len=0, sparse=None):
@@ -27,17 +27,19 @@ def activity(rng, n, gap_at=None, gap_len=0, sparse=None):
     alt = 1000 + 30 * np.sin(t / 200)
     power = np.clip(250 + 80 * np.sin(t / 30) + rng.normal(0, 20, len(t)), 0, None)
     hr = 140 + 15 * np.sin(t / 120)
-    return t, dist, alt, power, hr
+    cad = np.clip(85 + 10 * np.sin(t / 40) + rng.normal(0, 3, len(t)), 0, None)
+    return t, dist, alt, power, hr, cad
 
 
 def prepared(acts):
     ids = np.arange(1, len(acts) + 1, dtype=np.int64)
     offsets = np.concatenate([[0], np.cumsum([len(a[0]) for a in acts])]).astype(np.int64)
-    cat = [np.concatenate([a[k] for a in acts]) for k in range(5)]
+    cat = [np.concatenate([a[k] for a in acts]) for k in range(6)]
     return ec.prepare(
         activity_ids=ids, offsets=offsets, t=cat[0].astype(np.int64), dist=cat[1].astype(float), alt=cat[2].astype(float),
         power=cat[3].astype(float), hr=cat[4].astype(float),
         indoor=np.zeros(len(acts), np.uint8), powered=np.ones(len(acts), np.uint8), sport=SPORT,
+        cadence=cat[5].astype(float),
     )
 
 
@@ -56,8 +58,8 @@ LENGTHS = np.array([5, 30, 60, 300, 900], dtype=float)
 
 def test_power_matches_brute_force():
     rng = np.random.default_rng(1)
-    t, dist, alt, power, hr = activity(rng, 1500)
-    P = prepared([(t, dist, alt, power, hr)])
+    t, dist, alt, power, hr, cad = activity(rng, 1500)
+    P = prepared([(t, dist, alt, power, hr, cad)])
     y, t0 = P.compute("time", LENGTHS)
     cp = np.cumsum(power)  # running total includes second k; a window (i, i+L] sums seconds i+1..i+L
     for k, L in enumerate(LENGTHS.astype(int)):
@@ -131,3 +133,52 @@ def test_bad_input():
         P.compute("time", LENGTHS, activities=np.array([5], dtype=np.int64))
     with pytest.raises(ValueError):
         P.compute("time", LENGTHS, filters=[("nope", 0.0, 1.0)])
+
+
+def test_cadence_metrics_match_brute_force():
+    rng = np.random.default_rng(5)
+    t, dist, alt, power, hr, cad = activity(rng, 1200)
+    cad[300:360] = 0.0  # a minute of coasting
+    cad[500] = 999.0  # a glitch above the cap counts as nothing
+    P = prepared([(t, dist, alt, power, hr, cad)])
+    y, t0 = P.compute("time", LENGTHS)
+    c = np.where((cad > 0) & (cad <= 200), cad, 0.0)
+    rev = np.cumsum(c / 60)
+    ped = np.cumsum((c > 0).astype(float))
+    work = np.cumsum(power)
+    for k, L in enumerate(LENGTHS.astype(int)):
+        cbar = (rev[L:] - rev[:-L]) / L * 60
+        assert y[0, k, M["c"]] == pytest.approx(cbar.max(), rel=1e-5)
+        i = int(t0[0, k, M["c"]])
+        assert cbar[i] == pytest.approx(cbar.max(), rel=1e-5)
+        share = (ped[L:] - ped[:-L]) / L
+        assert y[0, k, M["ps"]] == pytest.approx(share.max(), rel=1e-6)
+        # torque and step length are ratios of the same running totals
+        dr = rev[L:] - rev[:-L]
+        tq = np.where(dr >= 1, (work[L:] - work[:-L]) / (2 * np.pi * np.maximum(dr, 1e-9)), -np.inf)
+        assert y[0, k, M["k"]] == pytest.approx(tq.max(), rel=1e-4)
+
+
+def test_no_cadence_means_no_cadence_metrics():
+    rng = np.random.default_rng(6)
+    t, dist, alt, power, hr, cad = activity(rng, 800)
+    acts = [(t, dist, alt, power, hr, np.full_like(cad, np.nan))]
+    P = prepared(acts)
+    y, _ = P.compute("time", LENGTHS)
+    for m in ("c", "k", "l", "pc", "ps"):
+        assert np.isnan(y[0, :, M[m]]).all()
+    assert not np.isnan(y[0, :, M["p"]]).all()
+
+
+def test_pedaling_cadence_filter_and_group():
+    rng = np.random.default_rng(8)
+    P = prepared([activity(rng, 2000), activity(rng, 1500)])
+    edges = np.array([60.0, 80.0, 90.0, 120.0])
+    yg, _ = P.compute("time", LENGTHS, group=("pc", edges))
+    for b in range(len(edges) - 1):
+        yf, _ = P.compute("time", LENGTHS, filters=[("pc", edges[b], np.nextafter(edges[b + 1], -np.inf))])
+        np.testing.assert_array_equal(yg[:, b], yf)
+    yf, _ = P.compute("time", LENGTHS, filters=[("pc", 80.0, 90.0)])
+    pc = yf[:, :, M["pc"]]
+    ok = ~np.isnan(pc)
+    assert ok.any() and np.all((pc[ok] >= 80 - 1e-4) & (pc[ok] <= 90 + 1e-4))
