@@ -3,7 +3,7 @@
 pub mod compute;
 pub mod prep;
 
-use compute::{Basis, Dim, Filter, M, METRICS};
+use compute::{Basis, Dim, Filter, Group, M, METRICS};
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use prep::{Params, Segment, Sport};
 use pyo3::exceptions::PyValueError;
@@ -28,20 +28,16 @@ impl Prepared {
     }
 }
 
+fn parse_dim(d: &str) -> PyResult<Dim> {
+    Ok(match d {
+        "t0" => Dim::T0,
+        "d0" => Dim::D0,
+        m => Dim::Metric(METRICS.iter().position(|x| *x == m).ok_or_else(|| PyValueError::new_err(format!("unknown dim {m}")))?),
+    })
+}
+
 fn parse_filters(filters: Vec<(String, f64, f64)>) -> PyResult<Vec<Filter>> {
-    filters
-        .into_iter()
-        .map(|(d, lo, hi)| {
-            let dim = match d.as_str() {
-                "t0" => Dim::T0,
-                "d0" => Dim::D0,
-                m => Dim::Metric(
-                    METRICS.iter().position(|x| *x == m).ok_or_else(|| PyValueError::new_err(format!("unknown filter dim {m}")))?,
-                ),
-            };
-            Ok(Filter { dim, lo, hi })
-        })
-        .collect()
+    filters.into_iter().map(|(d, lo, hi)| Ok(Filter { dim: parse_dim(&d)?, lo, hi })).collect()
 }
 
 #[pymethods]
@@ -64,9 +60,13 @@ impl Prepared {
 
     /// Best of each metric per activity and length.
     ///
-    /// Returns (y, t0): float32 and int32 arrays of shape (activities, lengths, metrics), metrics in
-    /// the order p, v, g, h, a, x. filters: (dim, lo, hi) with dim in p v g h a x t0 d0 and NaN for an open end.
-    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![]))]
+    /// Returns (y, t0): float32 and int32 arrays of shape (activities, lengths, metrics), or
+    /// (activities, groups, lengths, metrics) with `group`; metrics in the order p, v, g, h, a, x.
+    /// filters: (dim, lo, hi) with dim in p v g h a x t0 d0 and NaN for an open end (lo <= value <= hi).
+    /// group: (dim, edges); a window falls into bin i when edges[i] <= value < edges[i + 1], else it is skipped.
+    /// activities: indices into activity_ids to evaluate (default all), in output order.
+    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![], group=None, activities=None))]
+    #[allow(clippy::too_many_arguments)]
     fn compute<'py>(
         &self,
         py: Python<'py>,
@@ -74,6 +74,8 @@ impl Prepared {
         lengths: PyReadonlyArray1<'py, f64>,
         eps: f64,
         filters: Vec<(String, f64, f64)>,
+        group: Option<(String, PyReadonlyArray1<'py, f64>)>,
+        activities: Option<PyReadonlyArray1<'py, i64>>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let basis = match basis {
             "time" => Basis::Time,
@@ -82,16 +84,52 @@ impl Prepared {
         };
         let lengths = lengths.as_slice()?.to_vec();
         let filters = parse_filters(filters)?;
-        let results = py.allow_threads(|| compute::all(&self.by_act(), basis, &lengths, eps, &filters, &self.sport));
-        let (a, k) = (self.activity_ids.len(), lengths.len());
+        let group = match group {
+            Some((d, e)) => {
+                let edges = e.as_slice()?.to_vec();
+                if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
+                    return Err(PyValueError::new_err("group edges must be at least two increasing values"));
+                }
+                Some(Group { dim: parse_dim(&d)?, edges })
+            }
+            None => None,
+        };
+        let n_all = self.activity_ids.len();
+        let acts: Vec<usize> = match activities {
+            Some(ix) => ix
+                .as_slice()?
+                .iter()
+                .map(|&i| {
+                    if i >= 0 && (i as usize) < n_all {
+                        Ok(i as usize)
+                    } else {
+                        Err(PyValueError::new_err(format!("activity index {i} out of range")))
+                    }
+                })
+                .collect::<PyResult<_>>()?,
+            None => (0..n_all).collect(),
+        };
+        let results = py.allow_threads(|| {
+            compute::all(&self.by_act(), &acts, basis, &lengths, eps, &filters, group.as_ref(), &self.sport)
+        });
+        let (a, k) = (acts.len(), lengths.len());
+        let g = group.as_ref().map(|g| g.n());
         let mut y = Vec::with_capacity(a * k * M);
         let mut t0 = Vec::with_capacity(a * k * M);
         for r in results {
             y.extend_from_slice(&r.y);
             t0.extend_from_slice(&r.t0);
         }
-        let y = PyArray1::from_vec(py, y).reshape([a, k, M])?.into_any();
-        let t0 = PyArray1::from_vec(py, t0).reshape([a, k, M])?.into_any();
+        let (y, t0) = match g {
+            Some(g) => (
+                PyArray1::from_vec(py, y).reshape([a, g, k, M])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, g, k, M])?.into_any(),
+            ),
+            None => (
+                PyArray1::from_vec(py, y).reshape([a, k, M])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, k, M])?.into_any(),
+            ),
+        };
         Ok((y, t0))
     }
 }

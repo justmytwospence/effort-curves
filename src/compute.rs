@@ -45,7 +45,33 @@ impl Filter {
     }
 }
 
-/// Per activity: best value (NaN = none) and its start (seconds into the activity), [len][metric].
+/// Bins of one dimension: a window falls into bin i when edges[i] <= value < edges[i + 1].
+#[derive(Clone, Debug)]
+pub struct Group {
+    pub dim: Dim,
+    pub edges: Vec<f64>,
+}
+
+impl Group {
+    #[inline]
+    fn bin(&self, v: f64) -> Option<usize> {
+        if v.is_nan() {
+            return None;
+        }
+        let i = self.edges.partition_point(|&e| e <= v);
+        if i == 0 || i >= self.edges.len() {
+            None
+        } else {
+            Some(i - 1)
+        }
+    }
+
+    pub fn n(&self) -> usize {
+        self.edges.len().saturating_sub(1)
+    }
+}
+
+/// Per activity: best value (NaN = none) and its start (seconds into the activity), [group][len][metric].
 pub struct ActResult {
     pub y: Vec<f32>,
     pub t0: Vec<i32>,
@@ -84,20 +110,41 @@ fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn consider(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: Basis, sp: &Sport, filters: &[Filter], k: usize, res: &mut ActResult) {
+fn consider(
+    s: &Segment,
+    i: usize,
+    j: usize,
+    dt: f64,
+    dd: f64,
+    len: f64,
+    basis: Basis,
+    sp: &Sport,
+    filters: &[Filter],
+    group: Option<&Group>,
+    k_n: usize,
+    k: usize,
+    res: &mut ActResult,
+) {
     let mut w = [0.0; M];
     eval(s, i, j, dt, dd, len, basis, sp, &mut w);
+    let value = |dim: Dim| match dim {
+        Dim::Metric(m) => w[m],
+        Dim::T0 => s.t_off + i as f64,
+        Dim::D0 => s.d_off + s.cd[i],
+    };
     for f in filters {
-        let v = match f.dim {
-            Dim::Metric(m) => w[m],
-            Dim::T0 => s.t_off + i as f64,
-            Dim::D0 => s.d_off + s.cd[i],
-        };
-        if !f.pass(v) {
+        if !f.pass(value(f.dim)) {
             return;
         }
     }
-    let base = k * M;
+    let g = match group {
+        Some(gr) => match gr.bin(value(gr.dim)) {
+            Some(b) => b,
+            None => return,
+        },
+        None => 0,
+    };
+    let base = (g * k_n + k) * M;
     for m in 0..M {
         let v = w[m] as f32;
         let cur = res.y[base + m];
@@ -113,9 +160,18 @@ fn consider(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: 
 /// `eps` sets the start stride: windows of length L start every max(1, floor(eps * L)) seconds
 /// (for distance windows, every max(1, floor(eps * L / speed_cap)) seconds). eps = 0 is exhaustive.
 #[allow(clippy::too_many_arguments)]
-pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filters: &[Filter], sp: &Sport) -> ActResult {
+pub fn activity(
+    segs: &[&Segment],
+    basis: Basis,
+    lengths: &[f64],
+    eps: f64,
+    filters: &[Filter],
+    group: Option<&Group>,
+    sp: &Sport,
+) -> ActResult {
     let k_n = lengths.len();
-    let mut res = ActResult { y: vec![f32::NAN; k_n * M], t0: vec![-1; k_n * M] };
+    let g_n = group.map_or(1, |g| g.n());
+    let mut res = ActResult { y: vec![f32::NAN; g_n * k_n * M], t0: vec![-1; g_n * k_n * M] };
     for s in segs {
         let n = s.n();
         match basis {
@@ -132,13 +188,13 @@ pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filt
                     while i <= last {
                         let j = i + l;
                         let dd = s.cd[j] - s.cd[i];
-                        consider(s, i, j, dt, dd, len, basis, sp, filters, k, &mut res);
+                        consider(s, i, j, dt, dd, len, basis, sp, filters, group, k_n, k, &mut res);
                         i += stride;
                     }
                     // the window ending at the segment's end: with it, every window of a shorter length lies
                     // inside some evaluated window of a slightly longer one, which is what bounds the stride error
                     if stride > 1 && last % stride != 0 {
-                        consider(s, last, n - 1, dt, s.cd[n - 1] - s.cd[last], len, basis, sp, filters, k, &mut res);
+                        consider(s, last, n - 1, dt, s.cd[n - 1] - s.cd[last], len, basis, sp, filters, group, k_n, k, &mut res);
                     }
                 }
             }
@@ -166,7 +222,7 @@ pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filt
                             break;
                         }
                         let dt = (j - i) as f64;
-                        consider(s, i, j, dt, len, len, basis, sp, filters, k, &mut res);
+                        consider(s, i, j, dt, len, len, basis, sp, filters, group, k_n, k, &mut res);
                         last_i = i;
                         i += ((eps * dt) as usize).max(1);
                     }
@@ -177,7 +233,7 @@ pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filt
                         if i > last_i {
                             let j = s.cd.partition_point(|&c| c < s.cd[i] + len);
                             if j < n {
-                                consider(s, i, j, (j - i) as f64, len, len, basis, sp, filters, k, &mut res);
+                                consider(s, i, j, (j - i) as f64, len, len, basis, sp, filters, group, k_n, k, &mut res);
                             }
                         }
                     }
@@ -188,13 +244,25 @@ pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filt
     res
 }
 
-/// All activities in parallel. `by_act[a]` lists activity a's segments.
-pub fn all(by_act: &[Vec<&Segment>], basis: Basis, lengths: &[f64], eps: f64, filters: &[Filter], sp: &Sport) -> Vec<ActResult> {
+/// The selected activities in parallel, results in the order of `acts`. `by_act[a]` lists activity a's segments.
+#[allow(clippy::too_many_arguments)]
+pub fn all(
+    by_act: &[Vec<&Segment>],
+    acts: &[usize],
+    basis: Basis,
+    lengths: &[f64],
+    eps: f64,
+    filters: &[Filter],
+    group: Option<&Group>,
+    sp: &Sport,
+) -> Vec<ActResult> {
     // longest activities first so the stragglers start early
-    let mut order: Vec<usize> = (0..by_act.len()).collect();
-    order.sort_by_key(|&a| std::cmp::Reverse(by_act[a].iter().map(|s| s.n()).sum::<usize>()));
-    let mut done: Vec<(usize, ActResult)> =
-        order.par_iter().map(|&a| (a, activity(&by_act[a], basis, lengths, eps, filters, sp))).collect();
-    done.sort_by_key(|(a, _)| *a);
+    let mut order: Vec<usize> = (0..acts.len()).collect();
+    order.sort_by_key(|&o| std::cmp::Reverse(by_act[acts[o]].iter().map(|s| s.n()).sum::<usize>()));
+    let mut done: Vec<(usize, ActResult)> = order
+        .par_iter()
+        .map(|&o| (o, activity(&by_act[acts[o]], basis, lengths, eps, filters, group, sp)))
+        .collect();
+    done.sort_by_key(|(o, _)| *o);
     done.into_iter().map(|(_, r)| r).collect()
 }

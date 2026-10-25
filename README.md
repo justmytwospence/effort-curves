@@ -9,14 +9,22 @@ Mean-max effort curves from 1 Hz activity samples, in Rust with Python bindings.
 - **Glitches** are removed per sample: a second faster than the sport's speed cap, or climbing faster than the ascent cap, counts as no movement or no climbing. Gradient keeps a window-level cap.
 - **Strides.** A window of length L starts every max(1, floor(eps * L)) seconds, plus the window ending at the activity's end. A distance window advances by eps times its own duration. Together with a 1 % length grid, the per-activity "best at this length or longer" curve of every metric with a non-negative running total (power, speed, grade-adjusted pace, vertical speed) stays within about 1 % of the exhaustive one.
 - **Filters** (`(dim, lo, hi)` on p v g h a x, t0 = seconds in, d0 = metres in; NaN = open end) are applied per window, so two-sided bands are exact. That is the on-demand scan.
+- **Groups** (`group=(dim, edges)`) put each window into a bin of one dimension and keep the best per bin: value x-axes (pace by gradient) and band lines (by time into the activity) in one pass.
+- **Activities** (`activities=` indices) restrict a scan to a selection, such as a date window.
 
 ## Build
 
-No Rust toolchain on the host: `./build.sh` builds the abi3 wheel in the pinned `ghcr.io/pyo3/maturin` container, tuned for this CPU (`target-cpu=native`).
+No Rust toolchain on the host: `./build.sh` builds the abi3 manylinux wheel in the pinned `ghcr.io/pyo3/maturin` container, for x86-64-v3 CPUs (`TARGET_CPU=native` to tune it to the build machine). Releases attach that wheel.
 
 ```sh
 ./build.sh
 uv venv -p 3.12 .venv && uv pip install -p .venv duckdb numpy polars pyarrow dist/*.whl
+```
+
+## Test
+
+```sh
+uv pip install -p .venv pytest && .venv/bin/python -m pytest tests
 ```
 
 ## Benchmark
