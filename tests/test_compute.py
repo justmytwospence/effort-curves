@@ -142,7 +142,7 @@ def test_cadence_metrics_match_brute_force():
     cad[500] = 999.0  # a glitch above the cap counts as nothing
     P = prepared([(t, dist, alt, power, hr, cad)])
     y, t0 = P.compute("time", LENGTHS)
-    c = np.where((cad > 0) & (cad <= 200), cad, 0.0)
+    c = np.where((cad >= 20) & (cad <= 200), cad, 0.0)
     rev = np.cumsum(c / 60)
     ped = np.cumsum((c > 0).astype(float))
     work = np.cumsum(power)
@@ -155,7 +155,10 @@ def test_cadence_metrics_match_brute_force():
         assert y[0, k, M["ps"]] == pytest.approx(share.max(), rel=1e-6)
         # torque and step length are ratios of the same running totals
         dr = rev[L:] - rev[:-L]
-        tq = np.where(dr >= 1, (work[L:] - work[:-L]) / (2 * np.pi * np.maximum(dr, 1e-9)), -np.inf)
+        pw = np.cumsum(np.where(c > 0, power, 0.0))
+        dp = ped[L:] - ped[:-L]
+        pc = np.where(dp >= np.maximum(5, 0.25 * L), dr / np.maximum(dp, 1e-9) * 60, 0)
+        tq = np.where((dr >= 1) & (pc >= 30), (pw[L:] - pw[:-L]) / (2 * np.pi * np.maximum(dr, 1e-9)), -np.inf)
         assert y[0, k, M["k"]] == pytest.approx(tq.max(), rel=1e-4)
 
 
@@ -182,3 +185,16 @@ def test_pedaling_cadence_filter_and_group():
     pc = yf[:, :, M["pc"]]
     ok = ~np.isnan(pc)
     assert ok.any() and np.all((pc[ok] >= 80 - 1e-4) & (pc[ok] <= 90 + 1e-4))
+
+
+def test_torque_ignores_power_without_cadence():
+    """A trainer reporting power while the cadence sensor drops out must not produce huge torque."""
+    rng = np.random.default_rng(9)
+    t, dist, alt, power, hr, cad = activity(rng, 900)
+    cad[200:400] = np.nan
+    cad[400:410] = 2.0  # a near-stopped crank reading
+    P = prepared([(t, dist, alt, power, hr, cad)])
+    y, _ = P.compute("time", LENGTHS)
+    tq = y[0, :, M["k"]]
+    # 250 W at ~85 rpm is ~28 N·m; anything near 100 would mean the dropout leaked in
+    assert np.nanmax(tq) < 60

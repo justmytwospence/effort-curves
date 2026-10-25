@@ -20,7 +20,7 @@ pub struct Sport {
     /// grade-adjusted pace only for windows at least this long (s) / far (m)
     pub gap_min_time: f64,
     pub gap_min_dist: f64,
-    /// highest believable cadence (cycles per minute): a second above it counts as no pedaling or stepping
+    /// highest believable cadence (cycles per minute): a second above it, or under 20, counts as no pedaling or stepping
     pub cadence_cap: f64,
 }
 
@@ -74,6 +74,9 @@ pub struct Segment {
     /// empty when the activity recorded no cadence
     pub crev: Vec<f64>,
     pub cped: Vec<f64>,
+    /// cumulative work done while pedaling (J): torque counts only these seconds, so power recorded while the
+    /// cadence sensor drops out (a trainer in ERG mode) cannot inflate it; empty without both power and cadence
+    pub cpw: Vec<f64>,
     pub has_alt: bool,
 }
 
@@ -180,7 +183,8 @@ fn build_segment(
                 p[g] = pw[ptr];
             }
             let c = cad[ptr];
-            if c > 0.0 && c <= sp.cadence_cap {
+            // under 20 cycles a minute the crank (or a foot) is barely turning: a stalled sensor, not pedaling
+            if c >= 20.0 && c <= sp.cadence_cap {
                 cy[g] = c / 60.0;
                 cs[g] = 1.0;
             }
@@ -288,6 +292,11 @@ fn build_segment(
         ch: cumsum(&h),
         crev: if cs.iter().any(|&x| x > 0.0) { cumsum(&cy) } else { Vec::new() },
         cped: if cs.iter().any(|&x| x > 0.0) { cumsum(&cs) } else { Vec::new() },
+        cpw: if powered && cs.iter().any(|&x| x > 0.0) {
+            cumsum(&p.iter().zip(&cs).map(|(w, c)| if *c > 0.0 { *w } else { 0.0 }).collect::<Vec<f64>>())
+        } else {
+            Vec::new()
+        },
         chn: cumsum(&hn),
         ca,
         cg,
