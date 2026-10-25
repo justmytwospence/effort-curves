@@ -1,0 +1,200 @@
+//! Window evaluation: per activity, the best of each metric at each window length, optionally among
+//! windows passing range filters. Lengths are seconds (time basis) or metres (distance basis).
+
+use crate::prep::{Segment, Sport};
+use rayon::prelude::*;
+
+/// Metrics, in output order.
+pub const METRICS: [&str; 6] = ["p", "v", "g", "h", "a", "x"];
+pub const M: usize = METRICS.len();
+const P: usize = 0;
+const V: usize = 1;
+const G: usize = 2;
+const H: usize = 3;
+const A: usize = 4;
+const X: usize = 5;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Basis {
+    Time,
+    Dist,
+}
+
+/// What a filter tests: one of the window's own averages, or where it starts.
+#[derive(Clone, Copy, Debug)]
+pub enum Dim {
+    Metric(usize),
+    /// seconds into the activity at the window's start
+    T0,
+    /// metres into the activity at the window's start
+    D0,
+}
+
+/// lo <= value <= hi; NaN bounds are open. A window whose value is unknown fails.
+#[derive(Clone, Copy, Debug)]
+pub struct Filter {
+    pub dim: Dim,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl Filter {
+    #[inline]
+    fn pass(&self, v: f64) -> bool {
+        !v.is_nan() && (self.lo.is_nan() || v >= self.lo) && (self.hi.is_nan() || v <= self.hi)
+    }
+}
+
+/// Per activity: best value (NaN = none) and its start (seconds into the activity), [len][metric].
+pub struct ActResult {
+    pub y: Vec<f32>,
+    pub t0: Vec<i32>,
+}
+
+#[inline]
+fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis: Basis, sp: &Sport, out: &mut [f64; M]) {
+    out[P] = if s.cp.is_empty() { f64::NAN } else { (s.cp[j] - s.cp[i]) / dt };
+    out[V] = dd / dt;
+    let hn = s.chn[j] - s.chn[i];
+    out[H] = if hn >= 0.8 * dt { (s.ch[j] - s.ch[i]) / hn } else { f64::NAN };
+    let (ai, aj) = (s.ca[i], s.ca[j]);
+    let alt_ok = s.has_alt && !ai.is_nan() && !aj.is_nan();
+    out[G] = if alt_ok && dd >= 20f64.max(0.3 * dt) {
+        let g = (aj - ai) / dd;
+        if g.abs() <= sp.grade_cap { g } else { f64::NAN }
+    } else {
+        f64::NAN
+    };
+    let long_enough_a = match basis {
+        Basis::Time => basis_len >= sp.ascent_min,
+        Basis::Dist => true,
+    };
+    out[A] = if alt_ok && long_enough_a { (s.cg[j] - s.cg[i]) / dt } else { f64::NAN };
+    let long_enough_x = match basis {
+        Basis::Time => basis_len >= sp.gap_min_time,
+        Basis::Dist => basis_len >= sp.gap_min_dist,
+    };
+    out[X] = if !s.cx.is_empty() && long_enough_x {
+        let x = (s.cx[j] - s.cx[i]) / dt;
+        if x <= sp.speed_cap { x } else { f64::NAN }
+    } else {
+        f64::NAN
+    };
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn consider(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: Basis, sp: &Sport, filters: &[Filter], k: usize, res: &mut ActResult) {
+    let mut w = [0.0; M];
+    eval(s, i, j, dt, dd, len, basis, sp, &mut w);
+    for f in filters {
+        let v = match f.dim {
+            Dim::Metric(m) => w[m],
+            Dim::T0 => s.t_off + i as f64,
+            Dim::D0 => s.d_off + s.cd[i],
+        };
+        if !f.pass(v) {
+            return;
+        }
+    }
+    let base = k * M;
+    for m in 0..M {
+        let v = w[m] as f32;
+        let cur = res.y[base + m];
+        if v > cur || (cur.is_nan() && !v.is_nan()) {
+            res.y[base + m] = v;
+            res.t0[base + m] = (s.t_off + i as f64) as i32;
+        }
+    }
+}
+
+/// Evaluate every window of every length in one activity's segments.
+///
+/// `eps` sets the start stride: windows of length L start every max(1, floor(eps * L)) seconds
+/// (for distance windows, every max(1, floor(eps * L / speed_cap)) seconds). eps = 0 is exhaustive.
+#[allow(clippy::too_many_arguments)]
+pub fn activity(segs: &[&Segment], basis: Basis, lengths: &[f64], eps: f64, filters: &[Filter], sp: &Sport) -> ActResult {
+    let k_n = lengths.len();
+    let mut res = ActResult { y: vec![f32::NAN; k_n * M], t0: vec![-1; k_n * M] };
+    for s in segs {
+        let n = s.n();
+        match basis {
+            Basis::Time => {
+                for (k, &len) in lengths.iter().enumerate() {
+                    let l = len as usize;
+                    if l == 0 || l >= n {
+                        continue;
+                    }
+                    let stride = ((eps * len) as usize).max(1);
+                    let dt = len;
+                    let last = n - 1 - l;
+                    let mut i = 0;
+                    while i <= last {
+                        let j = i + l;
+                        let dd = s.cd[j] - s.cd[i];
+                        consider(s, i, j, dt, dd, len, basis, sp, filters, k, &mut res);
+                        i += stride;
+                    }
+                    // the window ending at the segment's end: with it, every window of a shorter length lies
+                    // inside some evaluated window of a slightly longer one, which is what bounds the stride error
+                    if stride > 1 && last % stride != 0 {
+                        consider(s, last, n - 1, dt, s.cd[n - 1] - s.cd[last], len, basis, sp, filters, k, &mut res);
+                    }
+                }
+            }
+            Basis::Dist => {
+                let total = s.cd[n - 1];
+                for (k, &len) in lengths.iter().enumerate() {
+                    if len > total {
+                        continue;
+                    }
+                    // starts spaced by eps times the current window's duration, so a skipped window lies inside an
+                    // evaluated one that is at most eps longer (striding by distance would skip the end of a stop)
+                    let stride = if eps > 0.0 { 2 } else { 1 }; // only decides whether the end window is needed
+                    let mut j = 0;
+                    let mut i = 0;
+                    let mut last_i = usize::MAX;
+                    while i < n {
+                        if j < i {
+                            j = i;
+                        }
+                        let target = s.cd[i] + len;
+                        while j < n && s.cd[j] < target {
+                            j += 1;
+                        }
+                        if j == n {
+                            break;
+                        }
+                        let dt = (j - i) as f64;
+                        consider(s, i, j, dt, len, len, basis, sp, filters, k, &mut res);
+                        last_i = i;
+                        i += ((eps * dt) as usize).max(1);
+                    }
+                    // the latest start whose window still fits, as for time windows
+                    if stride > 1 && last_i != usize::MAX {
+                        let end = s.cd[n - 1] - len;
+                        let i = s.cd.partition_point(|&c| c <= end).saturating_sub(1);
+                        if i > last_i {
+                            let j = s.cd.partition_point(|&c| c < s.cd[i] + len);
+                            if j < n {
+                                consider(s, i, j, (j - i) as f64, len, len, basis, sp, filters, k, &mut res);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    res
+}
+
+/// All activities in parallel. `by_act[a]` lists activity a's segments.
+pub fn all(by_act: &[Vec<&Segment>], basis: Basis, lengths: &[f64], eps: f64, filters: &[Filter], sp: &Sport) -> Vec<ActResult> {
+    // longest activities first so the stragglers start early
+    let mut order: Vec<usize> = (0..by_act.len()).collect();
+    order.sort_by_key(|&a| std::cmp::Reverse(by_act[a].iter().map(|s| s.n()).sum::<usize>()));
+    let mut done: Vec<(usize, ActResult)> =
+        order.par_iter().map(|&a| (a, activity(&by_act[a], basis, lengths, eps, filters, sp))).collect();
+    done.sort_by_key(|(a, _)| *a);
+    done.into_iter().map(|(_, r)| r).collect()
+}
