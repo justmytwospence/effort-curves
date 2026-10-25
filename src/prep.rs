@@ -77,6 +77,8 @@ pub struct Segment {
     /// cumulative work done while pedaling (J): torque counts only these seconds, so power recorded while the
     /// cadence sensor drops out (a trainer in ERG mode) cannot inflate it; empty without both power and cadence
     pub cpw: Vec<f64>,
+    /// cumulative distance covered while pedaling or stepping (m), for step length on the same terms
+    pub cdw: Vec<f64>,
     pub has_alt: bool,
 }
 
@@ -292,6 +294,11 @@ fn build_segment(
         ch: cumsum(&h),
         crev: if cs.iter().any(|&x| x > 0.0) { cumsum(&cy) } else { Vec::new() },
         cped: if cs.iter().any(|&x| x > 0.0) { cumsum(&cs) } else { Vec::new() },
+        cdw: if cs.iter().any(|&x| x > 0.0) {
+            cumsum(&step.iter().zip(&cs).map(|(d, c)| if *c > 0.0 { *d } else { 0.0 }).collect::<Vec<f64>>())
+        } else {
+            Vec::new()
+        },
         cpw: if powered && cs.iter().any(|&x| x > 0.0) {
             cumsum(&p.iter().zip(&cs).map(|(w, c)| if *c > 0.0 { *w } else { 0.0 }).collect::<Vec<f64>>())
         } else {

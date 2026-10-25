@@ -7,7 +7,7 @@ use rayon::prelude::*;
 /// Metrics, in output order.
 /// p power (W), v speed (m/s), g net gradient, h heart rate (bpm), a vertical speed (m/s), x grade-adjusted speed (m/s),
 /// c cadence over the whole window (cycles/min, coasting and stops count as zero), k crank torque (N·m: work while
-/// pedaling per radian of pedal revolution, at a pedaling cadence of at least 30/min), l distance per cycle (m: step length), pc cadence while pedaling or stepping
+/// pedaling per radian of pedal revolution, at a pedaling cadence of at least 30/min), l distance per cycle (m: step length, from distance covered while stepping), pc cadence while pedaling or stepping
 /// (cycles/min), ps share of the window spent pedaling or stepping (0-1)
 pub const METRICS: [&str; 11] = ["p", "v", "g", "h", "a", "x", "c", "k", "l", "pc", "ps"];
 pub const M: usize = METRICS.len();
@@ -133,7 +133,8 @@ fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis
         } else {
             f64::NAN
         };
-        out[L] = if enough { dd / rev } else { f64::NAN };
+        // step length: distance covered while stepping per step, at a real cadence, so a cadence dropout cannot inflate it
+        out[L] = if enough && out[PC] >= 30.0 { (s.cdw[j] - s.cdw[i]) / rev } else { f64::NAN };
     }
 }
 

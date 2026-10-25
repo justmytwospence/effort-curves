@@ -198,3 +198,13 @@ def test_torque_ignores_power_without_cadence():
     tq = y[0, :, M["k"]]
     # 250 W at ~85 rpm is ~28 N·m; anything near 100 would mean the dropout leaked in
     assert np.nanmax(tq) < 60
+
+
+def test_step_length_ignores_distance_without_cadence():
+    rng = np.random.default_rng(10)
+    t, dist, alt, power, hr, cad = activity(rng, 900)
+    cad[200:600] = np.nan  # the watch stops counting steps for a while
+    P = prepared([(t, dist, alt, power, hr, cad)])
+    y, _ = P.compute("time", LENGTHS)
+    # ~3 m/s at ~85 steps/min is about 2 m per step; a dropout leaking in would give tens of metres
+    assert np.nanmax(y[0, :, M["l"]]) < 4
