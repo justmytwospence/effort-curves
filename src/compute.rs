@@ -80,6 +80,11 @@ impl Group {
     }
 }
 
+/// Bins over one or more dimensions at once (row-major: the last group varies fastest). No groups is a single bin.
+fn cells(groups: &[Group]) -> usize {
+    groups.iter().map(|g| g.n()).product()
+}
+
 /// Per activity: best value (NaN = none) and its start (seconds into the activity), [group][len][metric].
 pub struct ActResult {
     pub y: Vec<f32>,
@@ -150,7 +155,7 @@ fn consider(
     basis: Basis,
     sp: &Sport,
     filters: &[Filter],
-    group: Option<&Group>,
+    groups: &[Group],
     k_n: usize,
     k: usize,
     res: &mut ActResult,
@@ -167,13 +172,13 @@ fn consider(
             return;
         }
     }
-    let g = match group {
-        Some(gr) => match gr.bin(value(gr.dim)) {
-            Some(b) => b,
+    let mut g = 0;
+    for gr in groups {
+        match gr.bin(value(gr.dim)) {
+            Some(b) => g = g * gr.n() + b,
             None => return,
-        },
-        None => 0,
-    };
+        }
+    }
     let base = (g * k_n + k) * M;
     for m in 0..M {
         let v = w[m] as f32;
@@ -196,11 +201,11 @@ pub fn activity(
     lengths: &[f64],
     eps: f64,
     filters: &[Filter],
-    group: Option<&Group>,
+    groups: &[Group],
     sp: &Sport,
 ) -> ActResult {
     let k_n = lengths.len();
-    let g_n = group.map_or(1, |g| g.n());
+    let g_n = cells(groups);
     let mut res = ActResult { y: vec![f32::NAN; g_n * k_n * M], t0: vec![-1; g_n * k_n * M] };
     for s in segs {
         let n = s.n();
@@ -218,13 +223,13 @@ pub fn activity(
                     while i <= last {
                         let j = i + l;
                         let dd = s.cd[j] - s.cd[i];
-                        consider(s, i, j, dt, dd, len, basis, sp, filters, group, k_n, k, &mut res);
+                        consider(s, i, j, dt, dd, len, basis, sp, filters, groups, k_n, k, &mut res);
                         i += stride;
                     }
                     // the window ending at the segment's end: with it, every window of a shorter length lies
                     // inside some evaluated window of a slightly longer one, which is what bounds the stride error
                     if stride > 1 && last % stride != 0 {
-                        consider(s, last, n - 1, dt, s.cd[n - 1] - s.cd[last], len, basis, sp, filters, group, k_n, k, &mut res);
+                        consider(s, last, n - 1, dt, s.cd[n - 1] - s.cd[last], len, basis, sp, filters, groups, k_n, k, &mut res);
                     }
                 }
             }
@@ -252,7 +257,7 @@ pub fn activity(
                             break;
                         }
                         let dt = (j - i) as f64;
-                        consider(s, i, j, dt, len, len, basis, sp, filters, group, k_n, k, &mut res);
+                        consider(s, i, j, dt, len, len, basis, sp, filters, groups, k_n, k, &mut res);
                         last_i = i;
                         i += ((eps * dt) as usize).max(1);
                     }
@@ -263,7 +268,7 @@ pub fn activity(
                         if i > last_i {
                             let j = s.cd.partition_point(|&c| c < s.cd[i] + len);
                             if j < n {
-                                consider(s, i, j, (j - i) as f64, len, len, basis, sp, filters, group, k_n, k, &mut res);
+                                consider(s, i, j, (j - i) as f64, len, len, basis, sp, filters, groups, k_n, k, &mut res);
                             }
                         }
                     }
@@ -283,7 +288,7 @@ pub fn all(
     lengths: &[f64],
     eps: f64,
     filters: &[Filter],
-    group: Option<&Group>,
+    groups: &[Group],
     sp: &Sport,
 ) -> Vec<ActResult> {
     // longest activities first so the stragglers start early
@@ -291,7 +296,7 @@ pub fn all(
     order.sort_by_key(|&o| std::cmp::Reverse(by_act[acts[o]].iter().map(|s| s.n()).sum::<usize>()));
     let mut done: Vec<(usize, ActResult)> = order
         .par_iter()
-        .map(|&o| (o, activity(&by_act[acts[o]], basis, lengths, eps, filters, group, sp)))
+        .map(|&o| (o, activity(&by_act[acts[o]], basis, lengths, eps, filters, groups, sp)))
         .collect();
     done.sort_by_key(|(o, _)| *o);
     done.into_iter().map(|(_, r)| r).collect()

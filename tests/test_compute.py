@@ -89,6 +89,26 @@ def test_group_bin_equals_filter(P):
         np.testing.assert_array_equal(tg[:, b], tf)
 
 
+def test_two_groups_equal_one_group_and_a_filter(P):
+    """Each cell of a two-dimensional grouping is the one-dimensional grouping filtered to the other bin."""
+    ev = np.array([2.5, 3.0, 3.5, 4.0])
+    et = np.array([0.0, 300.0, 900.0, 1e9])
+    y2, t2 = P.compute("time", LENGTHS, group=("v", ev), group2=("t0", et))
+    assert y2.shape == (P.compute("time", LENGTHS)[0].shape[0], 3, 3, len(LENGTHS), len(ec.METRICS))
+    for c in range(len(et) - 1):
+        y1, t1 = P.compute("time", LENGTHS, filters=[("t0", et[c], np.nextafter(et[c + 1], -np.inf))], group=("v", ev))
+        np.testing.assert_array_equal(y2[:, :, c], y1)
+        np.testing.assert_array_equal(t2[:, :, c], t1)
+    # and across both: the best over all cells of a bin is the one-dimensional bin's best
+    y1, _ = P.compute("time", LENGTHS, group=("v", ev))
+    np.testing.assert_array_equal(np.fmax.reduce(y2, axis=2), y1)
+
+
+def test_group2_needs_group(P):
+    with pytest.raises(ValueError):
+        P.compute("time", LENGTHS, group2=("v", np.array([2.0, 3.0])))
+
+
 def test_two_sided_filter_is_exact(P):
     """Every reported best respects the band, and the band's best is at most the unfiltered best."""
     lo, hi = 3.0, 3.6

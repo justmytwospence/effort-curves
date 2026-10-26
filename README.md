@@ -11,6 +11,7 @@ Mean-max effort curves from 1 Hz activity samples, in Rust with Python bindings.
 - **Metrics** per window: `p` power, `v` speed, `g` net gradient, `h` heart rate, `a` vertical speed, `x` grade-adjusted speed, `c` cadence over the whole window (coasting and stops count as zero, so it keeps the running-total guarantee), `k` crank torque (work per radian of pedal revolution), `l` distance per cycle (step length), `pc` cadence while pedaling or stepping, `ps` share of the window spent pedaling or stepping. Cadence is given in cycles per minute (pedal revolutions, or steps); seconds above the sport's cadence cap count as none.
 - **Filters** (`(dim, lo, hi)` on any metric, t0 = seconds in, d0 = metres in; NaN = open end) are applied per window, so two-sided bands are exact. That is the on-demand scan.
 - **Groups** (`group=(dim, edges)`) put each window into a bin of one dimension and keep the best per bin: value x-axes (pace by gradient) and band lines (by time into the activity) in one pass.
+  `group2=(dim, edges)` bins a second dimension at the same time, so every combination of two splits (band lines and animation bands, or a value axis and band lines) comes out of one pass, shaped (activities, groups, groups2, lengths, metrics).
 - **Activities** (`activities=` indices) restrict a scan to a selection, such as a date window.
 
 ## Build

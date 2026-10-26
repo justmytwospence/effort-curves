@@ -61,11 +61,13 @@ impl Prepared {
     /// Best of each metric per activity and length.
     ///
     /// Returns (y, t0): float32 and int32 arrays of shape (activities, lengths, metrics), or
-    /// (activities, groups, lengths, metrics) with `group`; metrics in the order p, v, g, h, a, x.
+    /// (activities, groups, lengths, metrics) with `group`, or (activities, groups, groups2, lengths, metrics) with
+    /// `group` and `group2`; metrics in the order of METRICS.
     /// filters: (dim, lo, hi) with dim in p v g h a x t0 d0 and NaN for an open end (lo <= value <= hi).
     /// group: (dim, edges); a window falls into bin i when edges[i] <= value < edges[i + 1], else it is skipped.
+    /// group2: a second (dim, edges), binned at the same time: one pass gives every combination of the two.
     /// activities: indices into activity_ids to evaluate (default all), in output order.
-    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![], group=None, activities=None))]
+    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![], group=None, activities=None, group2=None))]
     #[allow(clippy::too_many_arguments)]
     fn compute<'py>(
         &self,
@@ -76,6 +78,7 @@ impl Prepared {
         filters: Vec<(String, f64, f64)>,
         group: Option<(String, PyReadonlyArray1<'py, f64>)>,
         activities: Option<PyReadonlyArray1<'py, i64>>,
+        group2: Option<(String, PyReadonlyArray1<'py, f64>)>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let basis = match basis {
             "time" => Basis::Time,
@@ -84,16 +87,17 @@ impl Prepared {
         };
         let lengths = lengths.as_slice()?.to_vec();
         let filters = parse_filters(filters)?;
-        let group = match group {
-            Some((d, e)) => {
-                let edges = e.as_slice()?.to_vec();
-                if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
-                    return Err(PyValueError::new_err("group edges must be at least two increasing values"));
-                }
-                Some(Group { dim: parse_dim(&d)?, edges })
+        if group.is_none() && group2.is_some() {
+            return Err(PyValueError::new_err("group2 needs group"));
+        }
+        let mut groups = Vec::new();
+        for (d, e) in group.into_iter().chain(group2) {
+            let edges = e.as_slice()?.to_vec();
+            if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
+                return Err(PyValueError::new_err("group edges must be at least two increasing values"));
             }
-            None => None,
-        };
+            groups.push(Group { dim: parse_dim(&d)?, edges });
+        }
         let n_all = self.activity_ids.len();
         let acts: Vec<usize> = match activities {
             Some(ix) => ix
@@ -110,22 +114,26 @@ impl Prepared {
             None => (0..n_all).collect(),
         };
         let results = py.allow_threads(|| {
-            compute::all(&self.by_act(), &acts, basis, &lengths, eps, &filters, group.as_ref(), &self.sport)
+            compute::all(&self.by_act(), &acts, basis, &lengths, eps, &filters, &groups, &self.sport)
         });
         let (a, k) = (acts.len(), lengths.len());
-        let g = group.as_ref().map(|g| g.n());
+        let dims: Vec<usize> = groups.iter().map(|g| g.n()).collect();
         let mut y = Vec::with_capacity(a * k * M);
         let mut t0 = Vec::with_capacity(a * k * M);
         for r in results {
             y.extend_from_slice(&r.y);
             t0.extend_from_slice(&r.t0);
         }
-        let (y, t0) = match g {
-            Some(g) => (
+        let (y, t0) = match dims[..] {
+            [g1, g2] => (
+                PyArray1::from_vec(py, y).reshape([a, g1, g2, k, M])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, g1, g2, k, M])?.into_any(),
+            ),
+            [g] => (
                 PyArray1::from_vec(py, y).reshape([a, g, k, M])?.into_any(),
                 PyArray1::from_vec(py, t0).reshape([a, g, k, M])?.into_any(),
             ),
-            None => (
+            _ => (
                 PyArray1::from_vec(py, y).reshape([a, k, M])?.into_any(),
                 PyArray1::from_vec(py, t0).reshape([a, k, M])?.into_any(),
             ),
