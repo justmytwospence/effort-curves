@@ -150,3 +150,17 @@ def test_coarse_grid_is_refined_exactly(P, metric):
     d = P.frontier("time", metric, coarse, y[:, None, :, M[metric]].copy(), t0[:, None, :, M[metric]].copy(),
                    np.arange(4, dtype=np.int64), [[0, 1, 2, 3]])
     assert [(e["row"], e["len"], e["t0"]) for e in efforts(d)] == [(e["row"], e["len"], e["t0"]) for e in ref]
+
+
+def test_filters_without_groups_match_every_integer_length(P):
+    """Filters alone take the single-metric path; it must agree with the full evaluation."""
+    coarse = grid(5, 1200, 1.06)
+    fine = np.arange(5, coarse[-1] + 1, dtype=float)
+    flt = [("g", -0.02, 0.03), ("h", 130.0, NAN)]
+    yf, tf = P.compute("time", fine, filters=flt)
+    y, t0 = P.compute("time", coarse, filters=flt)
+    for metric in ("v", "p"):
+        ref = reference(yf[..., M[metric]], tf[..., M[metric]], fine, range(4))
+        d = P.frontier("time", metric, coarse, y[:, None, :, M[metric]].copy(), t0[:, None, :, M[metric]].copy(),
+                       np.arange(4, dtype=np.int64), [[0, 1, 2, 3]], filters=flt)
+        assert [(e["row"], e["len"], e["t0"]) for e in efforts(d)] == [(e["row"], e["len"], e["t0"]) for e in ref]

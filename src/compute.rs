@@ -286,6 +286,19 @@ fn eval_one(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, b
     match m {
         P => if s.cp.is_empty() { f64::NAN } else { (s.cp[j] - s.cp[i]) / dt },
         V => dd / dt,
+        H => {
+            let hn = s.chn[j] - s.chn[i];
+            if hn >= 0.8 * dt { (s.ch[j] - s.ch[i]) / hn } else { f64::NAN }
+        }
+        G => {
+            let (ai, aj) = (s.ca[i], s.ca[j]);
+            if s.has_alt && !ai.is_nan() && !aj.is_nan() && dd >= 20f64.max(0.3 * dt) {
+                let g = (aj - ai) / dd;
+                if g.abs() <= sp.grade_cap { g } else { f64::NAN }
+            } else {
+                f64::NAN
+            }
+        }
         A => {
             let alt_ok = s.has_alt && !s.ca[i].is_nan() && !s.ca[j].is_nan();
             let long_enough = match basis {
@@ -315,10 +328,10 @@ fn eval_one(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, b
     }
 }
 
-/// The best of one metric at each length in one activity, every start (exhaustive), with no filters or groups: the
-/// same result as `activity(.., eps = 0, [], [], ..)` for that metric, without computing the others.
-/// Returns (y, t0) per length.
-pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usize, sp: &Sport) -> (Vec<f32>, Vec<i32>) {
+/// The best of one metric at each length in one activity, every start (exhaustive), among windows passing `filters`
+/// (no groups): the same result as `activity(.., eps = 0, filters, [], ..)` for that metric, computing only it and
+/// the filtered dimensions. Returns (y, t0) per length.
+pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usize, filters: &[Filter], sp: &Sport) -> (Vec<f32>, Vec<i32>) {
     let k_n = lengths.len();
     let mut y = vec![f32::NAN; k_n];
     let mut t0 = vec![-1i32; k_n];
@@ -340,8 +353,11 @@ pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usiz
                     }
                     for i in 0..n - l {
                         let j = i + l;
-                        let v = eval_one(s, i, j, len, s.cd[j] - s.cd[i], len, basis, sp, m);
-                        put(k, v, s.t_off + i as f64);
+                        let dd = s.cd[j] - s.cd[i];
+                        if passes(s, i, j, len, dd, len, basis, sp, filters) {
+                            let v = eval_one(s, i, j, len, dd, len, basis, sp, m);
+                            put(k, v, s.t_off + i as f64);
+                        }
                     }
                 }
             }
@@ -363,14 +379,30 @@ pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usiz
                         if j == n {
                             break;
                         }
-                        let v = eval_one(s, i, j, (j - i) as f64, len, len, basis, sp, m);
-                        put(k, v, s.t_off + i as f64);
+                        let dt = (j - i) as f64;
+                        if passes(s, i, j, dt, len, len, basis, sp, filters) {
+                            let v = eval_one(s, i, j, dt, len, len, basis, sp, m);
+                            put(k, v, s.t_off + i as f64);
+                        }
                     }
                 }
             }
         }
     }
     (y, t0)
+}
+
+/// Whether a window passes every filter, evaluating only the filtered dimensions.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn passes(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: Basis, sp: &Sport, filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        f.pass(match f.dim {
+            Dim::Metric(d) => eval_one(s, i, j, dt, dd, len, basis, sp, d),
+            Dim::T0 => s.t_off + i as f64,
+            Dim::D0 => s.d_off + s.cd[i],
+        })
+    })
 }
 
 /// The largest window total of a metric with a non-negative running total, over an activity's segments (p v a x c;

@@ -158,8 +158,8 @@ impl Ctx<'_> {
     /// One row's best at each length (exhaustive): (value, t0).
     fn eval(&self, r: usize, ls: &[f64]) -> Vec<(f32, i32)> {
         let segs = &self.by_act[self.rows[r]];
-        if self.filters.is_empty() && self.groups.is_empty() {
-            let (y, t0) = activity_metric(segs, self.basis, ls, self.metric, self.sp);
+        if self.groups.is_empty() {
+            let (y, t0) = activity_metric(segs, self.basis, ls, self.metric, self.filters, self.sp);
             y.into_iter().zip(t0).collect()
         } else {
             let res = activity(segs, self.basis, ls, 0.0, self.filters, self.groups, self.sp);
