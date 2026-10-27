@@ -279,6 +279,122 @@ pub fn activity(
     res
 }
 
+/// One metric of a window, as `eval` computes it (the same arithmetic, so the values are identical).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn eval_one(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis: Basis, sp: &Sport, m: usize) -> f64 {
+    match m {
+        P => if s.cp.is_empty() { f64::NAN } else { (s.cp[j] - s.cp[i]) / dt },
+        V => dd / dt,
+        A => {
+            let alt_ok = s.has_alt && !s.ca[i].is_nan() && !s.ca[j].is_nan();
+            let long_enough = match basis {
+                Basis::Time => basis_len >= sp.ascent_min,
+                Basis::Dist => true,
+            };
+            if alt_ok && long_enough { (s.cg[j] - s.cg[i]) / dt } else { f64::NAN }
+        }
+        X => {
+            let long_enough = match basis {
+                Basis::Time => basis_len >= sp.gap_min_time,
+                Basis::Dist => basis_len >= sp.gap_min_dist,
+            };
+            if !s.cx.is_empty() && long_enough {
+                let x = (s.cx[j] - s.cx[i]) / dt;
+                if x <= sp.speed_cap { x } else { f64::NAN }
+            } else {
+                f64::NAN
+            }
+        }
+        C => if s.crev.is_empty() { f64::NAN } else { (s.crev[j] - s.crev[i]) / dt * 60.0 },
+        _ => {
+            let mut w = [0.0; M];
+            eval(s, i, j, dt, dd, basis_len, basis, sp, &mut w);
+            w[m]
+        }
+    }
+}
+
+/// The best of one metric at each length in one activity, every start (exhaustive), with no filters or groups: the
+/// same result as `activity(.., eps = 0, [], [], ..)` for that metric, without computing the others.
+/// Returns (y, t0) per length.
+pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usize, sp: &Sport) -> (Vec<f32>, Vec<i32>) {
+    let k_n = lengths.len();
+    let mut y = vec![f32::NAN; k_n];
+    let mut t0 = vec![-1i32; k_n];
+    let mut put = |k: usize, v: f64, t: f64| {
+        let v = v as f32;
+        if v > y[k] || (y[k].is_nan() && !v.is_nan()) {
+            y[k] = v;
+            t0[k] = t as i32;
+        }
+    };
+    for s in segs {
+        let n = s.n();
+        match basis {
+            Basis::Time => {
+                for (k, &len) in lengths.iter().enumerate() {
+                    let l = len as usize;
+                    if l == 0 || l >= n {
+                        continue;
+                    }
+                    for i in 0..n - l {
+                        let j = i + l;
+                        let v = eval_one(s, i, j, len, s.cd[j] - s.cd[i], len, basis, sp, m);
+                        put(k, v, s.t_off + i as f64);
+                    }
+                }
+            }
+            Basis::Dist => {
+                let total = s.cd[n - 1];
+                for (k, &len) in lengths.iter().enumerate() {
+                    if len > total {
+                        continue;
+                    }
+                    let mut j = 0;
+                    for i in 0..n {
+                        if j < i {
+                            j = i;
+                        }
+                        let target = s.cd[i] + len;
+                        while j < n && s.cd[j] < target {
+                            j += 1;
+                        }
+                        if j == n {
+                            break;
+                        }
+                        let v = eval_one(s, i, j, (j - i) as f64, len, len, basis, sp, m);
+                        put(k, v, s.t_off + i as f64);
+                    }
+                }
+            }
+        }
+    }
+    (y, t0)
+}
+
+/// The largest window total of a metric with a non-negative running total, over an activity's segments (p v a x c;
+/// None for the others): no window of length L averages more than this over L.
+pub fn max_total(segs: &[&Segment], m: usize) -> Option<f64> {
+    let span = |c: &[f64]| if c.is_empty() { 0.0 } else { c[c.len() - 1] - c[0] };
+    let per = |s: &Segment| match m {
+        P => Some(span(&s.cp)),
+        V => Some(span(&s.cd)),
+        A => Some(span(&s.cg)),
+        X => Some(span(&s.cx)),
+        C => Some(span(&s.crev) * 60.0),
+        _ => None,
+    };
+    let mut best: Option<f64> = Some(0.0);
+    for s in segs {
+        best = match (best, per(s)) {
+            (Some(b), Some(v)) => Some(b.max(v)),
+            _ => None,
+        };
+    }
+    best
+}
+
 /// The selected activities in parallel, results in the order of `acts`. `by_act[a]` lists activity a's segments.
 #[allow(clippy::too_many_arguments)]
 pub fn all(

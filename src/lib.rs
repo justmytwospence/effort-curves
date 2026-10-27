@@ -1,10 +1,12 @@
 //! Python bindings for the effort-curve prototype.
 
 pub mod compute;
+pub mod frontier;
 pub mod prep;
 
 use compute::{Basis, Dim, Filter, Group, M, METRICS};
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
+use pyo3::types::PyDict;
 use prep::{Params, Segment, Sport};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -40,6 +42,32 @@ fn parse_filters(filters: Vec<(String, f64, f64)>) -> PyResult<Vec<Filter>> {
     filters.into_iter().map(|(d, lo, hi)| Ok(Filter { dim: parse_dim(&d)?, lo, hi })).collect()
 }
 
+fn parse_groups<'py>(
+    group: Option<(String, PyReadonlyArray1<'py, f64>)>,
+    group2: Option<(String, PyReadonlyArray1<'py, f64>)>,
+) -> PyResult<Vec<Group>> {
+    if group.is_none() && group2.is_some() {
+        return Err(PyValueError::new_err("group2 needs group"));
+    }
+    let mut groups = Vec::new();
+    for (d, e) in group.into_iter().chain(group2) {
+        let edges = e.as_slice()?.to_vec();
+        if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
+            return Err(PyValueError::new_err("group edges must be at least two increasing values"));
+        }
+        groups.push(Group { dim: parse_dim(&d)?, edges });
+    }
+    Ok(groups)
+}
+
+fn parse_basis(basis: &str) -> PyResult<Basis> {
+    match basis {
+        "time" => Ok(Basis::Time),
+        "dist" => Ok(Basis::Dist),
+        b => Err(PyValueError::new_err(format!("unknown basis {b}"))),
+    }
+}
+
 #[pymethods]
 impl Prepared {
     #[getter]
@@ -56,6 +84,75 @@ impl Prepared {
     #[getter]
     fn seconds(&self) -> usize {
         self.segs.iter().map(|s| s.n()).sum()
+    }
+
+    /// The frontier of one metric as efforts, for each set of activities and each group cell.
+    ///
+    /// y, t0: `compute`'s output for that metric (not enveloped), shaped (rows, cells, lengths), cells being the
+    /// product of the groups (1 without). activities: the Prepared index of each row (as passed to `compute`).
+    /// sets: lists of rows, one frontier each (a single row gives that activity's own efforts). filters, group,
+    /// group2: as given to `compute`, so refined windows obey them too. refine: find each handoff to the second or
+    /// metre (else at grid resolution).
+    /// Returns a dict of arrays, one entry per effort: set, cell, effort (order along the frontier), row, t0 (start of
+    /// its full window), len (its full length), y (its value there), from_len (it holds the frontier above this
+    /// length; NaN for the first), from_y (the frontier just above from_len).
+    #[pyo3(signature = (basis, metric, lengths, y, t0, activities, sets, filters=vec![], group=None, group2=None, refine=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn frontier<'py>(
+        &self,
+        py: Python<'py>,
+        basis: &str,
+        metric: &str,
+        lengths: PyReadonlyArray1<'py, f64>,
+        y: PyReadonlyArray3<'py, f32>,
+        t0: PyReadonlyArray3<'py, i32>,
+        activities: PyReadonlyArray1<'py, i64>,
+        sets: Vec<Vec<usize>>,
+        filters: Vec<(String, f64, f64)>,
+        group: Option<(String, PyReadonlyArray1<'py, f64>)>,
+        group2: Option<(String, PyReadonlyArray1<'py, f64>)>,
+        refine: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let basis = parse_basis(basis)?;
+        let m = METRICS.iter().position(|x| *x == metric).ok_or_else(|| PyValueError::new_err(format!("unknown metric {metric}")))?;
+        let lengths = lengths.as_slice()?.to_vec();
+        if lengths.windows(2).any(|w| !(w[0] < w[1])) {
+            return Err(PyValueError::new_err("lengths must increase"));
+        }
+        let filters = parse_filters(filters)?;
+        let groups = parse_groups(group, group2)?;
+        let cells: usize = groups.iter().map(|g| g.n()).product();
+        let shape = y.shape().to_vec();
+        if shape != t0.shape() || shape[1] != cells || shape[2] != lengths.len() {
+            return Err(PyValueError::new_err(format!("y and t0 must be shaped (rows, {cells}, {})", lengths.len())));
+        }
+        let n_all = self.activity_ids.len();
+        let rows: Vec<usize> = activities
+            .as_slice()?
+            .iter()
+            .map(|&i| if i >= 0 && (i as usize) < n_all { Ok(i as usize) } else { Err(PyValueError::new_err(format!("activity index {i} out of range"))) })
+            .collect::<PyResult<_>>()?;
+        if rows.len() != shape[0] {
+            return Err(PyValueError::new_err("one activity per row of y"));
+        }
+        if sets.iter().flatten().any(|&r| r >= rows.len()) {
+            return Err(PyValueError::new_err("set refers to a row out of range"));
+        }
+        let (ys, ts) = (y.as_slice()?, t0.as_slice()?);
+        let grid = frontier::Grid { y: ys, t0: ts, cells, k: lengths.len() };
+        let by_act = self.by_act();
+        let eff = py.allow_threads(|| frontier::all(&by_act, &rows, &grid, &sets, &lengths, m, basis, &filters, &groups, &self.sport, refine));
+        let d = PyDict::new(py);
+        d.set_item("set", PyArray1::from_vec(py, eff.iter().map(|e| e.set as i64).collect()))?;
+        d.set_item("cell", PyArray1::from_vec(py, eff.iter().map(|e| e.cell as i64).collect()))?;
+        d.set_item("effort", PyArray1::from_vec(py, eff.iter().map(|e| e.effort as i64).collect()))?;
+        d.set_item("row", PyArray1::from_vec(py, eff.iter().map(|e| e.row as i64).collect()))?;
+        d.set_item("t0", PyArray1::from_vec(py, eff.iter().map(|e| e.t0).collect()))?;
+        d.set_item("len", PyArray1::from_vec(py, eff.iter().map(|e| e.len).collect()))?;
+        d.set_item("y", PyArray1::from_vec(py, eff.iter().map(|e| e.y).collect()))?;
+        d.set_item("from_len", PyArray1::from_vec(py, eff.iter().map(|e| e.from_len).collect()))?;
+        d.set_item("from_y", PyArray1::from_vec(py, eff.iter().map(|e| e.from_y).collect()))?;
+        Ok(d)
     }
 
     /// Best of each metric per activity and length.
@@ -80,24 +177,10 @@ impl Prepared {
         activities: Option<PyReadonlyArray1<'py, i64>>,
         group2: Option<(String, PyReadonlyArray1<'py, f64>)>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-        let basis = match basis {
-            "time" => Basis::Time,
-            "dist" => Basis::Dist,
-            b => return Err(PyValueError::new_err(format!("unknown basis {b}"))),
-        };
+        let basis = parse_basis(basis)?;
         let lengths = lengths.as_slice()?.to_vec();
         let filters = parse_filters(filters)?;
-        if group.is_none() && group2.is_some() {
-            return Err(PyValueError::new_err("group2 needs group"));
-        }
-        let mut groups = Vec::new();
-        for (d, e) in group.into_iter().chain(group2) {
-            let edges = e.as_slice()?.to_vec();
-            if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
-                return Err(PyValueError::new_err("group edges must be at least two increasing values"));
-            }
-            groups.push(Group { dim: parse_dim(&d)?, edges });
-        }
+        let groups = parse_groups(group, group2)?;
         let n_all = self.activity_ids.len();
         let acts: Vec<usize> = match activities {
             Some(ix) => ix
