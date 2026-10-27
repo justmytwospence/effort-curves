@@ -224,7 +224,9 @@ impl Prepared {
     /// group: (dim, edges); a window falls into bin i when edges[i] <= value < edges[i + 1], else it is skipped.
     /// group2: a second (dim, edges), binned at the same time: one pass gives every combination of the two.
     /// activities: indices into activity_ids to evaluate (default all), in output order.
-    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![], group=None, activities=None, group2=None))]
+    /// metrics: names of the metrics to return (default all, in the order of METRICS); the last axis follows this list.
+    /// A fine-binned pass for one metric is a tenth of the size.
+    #[pyo3(signature = (basis, lengths, eps=0.0, filters=vec![], group=None, activities=None, group2=None, metrics=None))]
     #[allow(clippy::too_many_arguments)]
     fn compute<'py>(
         &self,
@@ -236,8 +238,17 @@ impl Prepared {
         group: Option<(String, PyReadonlyArray1<'py, f64>)>,
         activities: Option<PyReadonlyArray1<'py, i64>>,
         group2: Option<(String, PyReadonlyArray1<'py, f64>)>,
+        metrics: Option<Vec<String>>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let basis = parse_basis(basis)?;
+        let keep: Vec<usize> = match &metrics {
+            None => (0..M).collect(),
+            Some(ms) => ms
+                .iter()
+                .map(|m| METRICS.iter().position(|x| x == m).ok_or_else(|| PyValueError::new_err(format!("unknown metric {m}"))))
+                .collect::<PyResult<_>>()?,
+        };
+        let mk = keep.len();
         let lengths = lengths.as_slice()?.to_vec();
         let filters = parse_filters(filters)?;
         let groups = parse_groups(group, group2)?;
@@ -261,24 +272,34 @@ impl Prepared {
         });
         let (a, k) = (acts.len(), lengths.len());
         let dims: Vec<usize> = groups.iter().map(|g| g.n()).collect();
-        let mut y = Vec::with_capacity(a * k * M);
-        let mut t0 = Vec::with_capacity(a * k * M);
+        let cells: usize = dims.iter().product();
+        let mut y = Vec::with_capacity(a * cells * k * mk);
+        let mut t0 = Vec::with_capacity(a * cells * k * mk);
         for r in results {
-            y.extend_from_slice(&r.y);
-            t0.extend_from_slice(&r.t0);
+            if mk == M {
+                y.extend_from_slice(&r.y);
+                t0.extend_from_slice(&r.t0);
+            } else {
+                for c in 0..r.y.len() / M {
+                    for &m in &keep {
+                        y.push(r.y[c * M + m]);
+                        t0.push(r.t0[c * M + m]);
+                    }
+                }
+            }
         }
         let (y, t0) = match dims[..] {
             [g1, g2] => (
-                PyArray1::from_vec(py, y).reshape([a, g1, g2, k, M])?.into_any(),
-                PyArray1::from_vec(py, t0).reshape([a, g1, g2, k, M])?.into_any(),
+                PyArray1::from_vec(py, y).reshape([a, g1, g2, k, mk])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, g1, g2, k, mk])?.into_any(),
             ),
             [g] => (
-                PyArray1::from_vec(py, y).reshape([a, g, k, M])?.into_any(),
-                PyArray1::from_vec(py, t0).reshape([a, g, k, M])?.into_any(),
+                PyArray1::from_vec(py, y).reshape([a, g, k, mk])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, g, k, mk])?.into_any(),
             ),
             _ => (
-                PyArray1::from_vec(py, y).reshape([a, k, M])?.into_any(),
-                PyArray1::from_vec(py, t0).reshape([a, k, M])?.into_any(),
+                PyArray1::from_vec(py, y).reshape([a, k, mk])?.into_any(),
+                PyArray1::from_vec(py, t0).reshape([a, k, mk])?.into_any(),
             ),
         };
         Ok((y, t0))
@@ -378,9 +399,86 @@ fn prepare<'py>(
     Ok(Prepared { activity_ids: ids, segs, sport })
 }
 
+/// The best over a range of consecutive bins, for every position of the range: y, t0 shaped (rows, bins, rest) (a
+/// fine-binned `compute` for one metric, reshaped so everything after the bin axis is one axis), width in bins.
+/// Returns (y, t0) shaped (rows, bins - width + 1, rest): at position p, the best over bins p .. p + width - 1 (NaN
+/// ignored) and the t0 of the window that gave it. A sliding maximum, linear in the input.
+#[pyfunction]
+fn range_frames<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray3<'py, f32>,
+    t0: PyReadonlyArray3<'py, i32>,
+    width: usize,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let sh = y.shape().to_vec();
+    if sh != t0.shape() {
+        return Err(PyValueError::new_err("y and t0 must have the same shape"));
+    }
+    let (rows, bins, rest) = (sh[0], sh[1], sh[2]);
+    if width == 0 || width > bins {
+        return Err(PyValueError::new_err(format!("width must be 1..={bins}")));
+    }
+    let (ys, ts) = (y.as_slice()?, t0.as_slice()?);
+    let pos = bins - width + 1;
+    let out: Vec<(Vec<f32>, Vec<i32>)> = py.allow_threads(|| {
+        (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                let mut oy = vec![f32::NAN; pos * rest];
+                let mut ot = vec![-1i32; pos * rest];
+                let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::with_capacity(width);
+                for c in 0..rest {
+                    let at = |b: usize| (r * bins + b) * rest + c;
+                    dq.clear();
+                    for b in 0..bins {
+                        let v = ys[at(b)];
+                        // a monotone deque of bins whose value could still be the maximum (NaN never is)
+                        if !v.is_nan() {
+                            while let Some(&q) = dq.back() {
+                                if ys[at(q)] <= v {
+                                    dq.pop_back();
+                                } else {
+                                    break;
+                                }
+                            }
+                            dq.push_back(b);
+                        }
+                        while let Some(&q) = dq.front() {
+                            if q + width <= b {
+                                dq.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if b + 1 >= width {
+                            let p = b + 1 - width;
+                            if let Some(&q) = dq.front() {
+                                oy[p * rest + c] = ys[at(q)];
+                                ot[p * rest + c] = ts[at(q)];
+                            }
+                        }
+                    }
+                }
+                (oy, ot)
+            })
+            .collect()
+    });
+    let mut yv = Vec::with_capacity(rows * pos * rest);
+    let mut tv = Vec::with_capacity(rows * pos * rest);
+    for (a, b) in out {
+        yv.extend(a);
+        tv.extend(b);
+    }
+    Ok((
+        PyArray1::from_vec(py, yv).reshape([rows, pos, rest])?.into_any(),
+        PyArray1::from_vec(py, tv).reshape([rows, pos, rest])?.into_any(),
+    ))
+}
+
 #[pymodule]
 fn effort_curves(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare, m)?)?;
+    m.add_function(wrap_pyfunction!(range_frames, m)?)?;
     m.add_class::<Prepared>()?;
     m.add("METRICS", METRICS.to_vec())?;
     Ok(())
