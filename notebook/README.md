@@ -5,7 +5,7 @@ the main consumer of this engine until it moves into garmin-mcp. The live copy i
 restore point, not the source of truth.
 
 - `notebook.py`, `pyproject.toml`, `uv.lock`: the notebook and its environment (MarimoHub version
-  `ver_01M5Y0NCNBDWPE0ZYAZSAF4P6H`)
+  `ver_01M5Y1E85Z6ZBT1JKS88VMWARN`)
 - `studio/notebook/dashboard/`: the Studio dashboard page that is its app view
 
 To restore, copy these files back into the notebook's workspace.

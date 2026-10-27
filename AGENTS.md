@@ -55,6 +55,7 @@ The workspace is on the host at `~/homelab/marimo/data/projects/proj-04vwegq2rf4
   - a reload gets the new version;
   - a drained session retires once it has had no visitors for the app idle timeout (8 h).
 - After a save, tell the user to reload; do not restart anything for them.
+- MarimoHub caps sessions per user at 4 (`MARIMOHUB_MAX_SESSIONS_PER_USER`), and a notebook's app sessions count against it: once 4 are running, a reload of the new version gets HTTP 429 and the page does not load, for the user too. So the bound below is not optional.
 - To keep memory bounded (an app sandbox holds about 1.4 GB), at most two app sessions should run: the newest, and the one before it, which may be the user's open tab. On a save you may stop app sessions older than those two. Never stop either of them.
   - `list_catalog` shows only the IDs and status, so record which app sessions exist after each save to know their order.
 

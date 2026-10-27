@@ -481,6 +481,7 @@ def cube_defs():
         DISPLAY_TIME,
         DISTANCES,
         DURATIONS,
+        GAP_MODEL_PATH,
         GAP_SPORTS,
         POS_DAYS,
         POS_PCTS,
@@ -1090,6 +1091,7 @@ def preset(
         "Run · Durability: best 10 min by time into the run": dict(sport="Run", y="v", x="tb", length="10 min", lines="none", filters={"tb": [0, 240]}),
         "Run · Durability: best mile by distance into the run": dict(sport="Run", y="v", x="db", length="1 mi", lines="none"),
         "Run · Efficiency: best 10 min pace by heart rate": dict(sport="Run", y="v", x="hb", length="10 min", lines="none", filters={"gb": [-2, 2]}),
+        "Run · Hills: best 5 min pace by gradient": dict(sport="Run", y="v", x="gb", length="5 min", lines="none"),
         "Run · Pace curve by time into the run": dict(sport="Run", y="v", x="len_time", lines="none", animate="tb", filters={"tb": [0, 240]}),
         "Run · Pace by gradient, year by year": dict(sport="Run", y="v", x="gb", length="5 min", lines="none", animate="year", period="all"),
         "Run · Pace by gradient": dict(sport="Run", y="v", x="gb", length="5 min", lines="none"),
@@ -1422,6 +1424,8 @@ def curve(
     DISPLAY_DIST,
     DISPLAY_TIME,
     FILTER_FULL,
+    GAP_MODEL_PATH,
+    GAP_SPORTS,
     HR_INVOLVED,
     METRIC_DIM,
     POS_DAYS,
@@ -1513,11 +1517,22 @@ def curve(
     # a frontier, held at least that far in). Other dimensions' bands are disjoint ranges.
     # Heart rate has one too for outputs that are better when higher at the same effort (pace, grade-adjusted pace,
     # power, climbing rate): a lower heart rate is harder, so its bands hold every window at most that heart rate.
-    BAND_KIND = {"tb": "at_least", "db": "at_least", **({"hb": "at_most"} if _ym in ("v", "x", "p", "a") else {})}
+    # Gradient has one for pace where a grade-adjustment model says how hard each gradient is: running is easiest at some
+    # downhill gradient p (the model's fastest), and harder going either way from it, steeper up or steeper down. Its
+    # bands are two nested families from p ("≥ x %" uphill, "≤ x %" downhill), and as an x axis it is two staircases.
+    GRADE_PIVOT = None
+    if _ym == "v" and sport.value in GAP_SPORTS and Path(GAP_MODEL_PATH).exists():
+        _gm = pl.read_parquet(GAP_MODEL_PATH)
+        GRADE_PIVOT = float(_gm["gp"][int(_gm["r"].arg_max())])
+    BAND_KIND = {"tb": "at_least", "db": "at_least", **({"hb": "at_most"} if _ym in ("v", "x", "p", "a") else {}),
+                 **({"gb": "two_sided"} if GRADE_PIVOT is not None else {})}
 
 
     def _band_filter(k, lo, hi):
         """The engine filter of a band of k (engine units): [lo, hi), or open on the easy side when cumulative."""
+        if BAND_KIND.get(k) == "two_sided":
+            # uphill of the pivot: at least this steep; downhill: at least this steep downhill
+            return (_ENGINE[k], lo, float("nan")) if lo >= GRADE_PIVOT / 100 - 1e-9 else (_ENGINE[k], float("nan"), float(np.nextafter(hi, -np.inf)))
         if BAND_KIND.get(k) == "at_least":
             return (_ENGINE[k], lo, float("nan"))
         if BAND_KIND.get(k) == "at_most":
@@ -1542,6 +1557,12 @@ def curve(
         # a dash between two numbers reads as a minus once either is negative, so those say "to", with a real minus sign
         _sep = lambda a, b: " to " if min(a, b) < 0 else "–"
         _num = lambda v: _unit(k, v).replace("-", "−")
+        if BAND_KIND.get(k) == "two_sided":
+            # the bands meet at the easiest gradient: a band above it holds every window at least its start, below it every
+            # window at most its end
+            if _e[0] < GRADE_PIVOT < _e[-1] and GRADE_PIVOT not in _e:
+                _e = sorted(_e + [GRADE_PIVOT])
+            return _e, [f"≥ {_num(_e[i])}{_UNITS[k]}" if _e[i] >= GRADE_PIVOT else f"≤ {_num(_e[i + 1])}{_UNITS[k]}" for i in range(len(_e) - 1)]
         if BAND_KIND.get(k) == "at_most":
             return _e, ["Any heart rate" if (i == len(_e) - 2 and _e[-1] >= FILTER_FULL[k][1]) else f"≤ {_num(_e[i + 1])}{_UNITS[k]}"
                         for i in range(len(_e) - 1)]
@@ -1730,11 +1751,20 @@ def curve(
                     if _bk:
                         # cumulative: each band takes the best of its neighbour on the easy side, running from the hard end
                         _y, _t0 = np.moveaxis(_y, 1 + _gi, 0).copy(), np.moveaxis(_t0, 1 + _gi, 0).copy()
-                        _nbr = 1 if _bk == "at_least" else -1
-                        for _bi in (range(_y.shape[0] - 2, -1, -1) if _bk == "at_least" else range(1, _y.shape[0])):
-                            _take = (_y[_bi + _nbr] > _y[_bi]) | (np.isnan(_y[_bi]) & ~np.isnan(_y[_bi + _nbr]))
-                            _y[_bi] = np.where(_take, _y[_bi + _nbr], _y[_bi])
-                            _t0[_bi] = np.where(_take, _t0[_bi + _nbr], _t0[_bi])
+                        _nb_ = _y.shape[0]
+                        if _bk == "two_sided":
+                            # bins below the pivot run up from the steepest descent, bins above it down from the steepest climb
+                            _kp = (_edges if _role == "lines" else _ae).index(GRADE_PIVOT)
+                            _passes = [(range(1, _kp), -1), (range(_nb_ - 2, _kp - 1, -1), 1)]
+                        elif _bk == "at_least":
+                            _passes = [(range(_nb_ - 2, -1, -1), 1)]
+                        else:
+                            _passes = [(range(1, _nb_), -1)]
+                        for _rng, _nbr in _passes:
+                            for _bi in _rng:
+                                _take = (_y[_bi + _nbr] > _y[_bi]) | (np.isnan(_y[_bi]) & ~np.isnan(_y[_bi + _nbr]))
+                                _y[_bi] = np.where(_take, _y[_bi + _nbr], _y[_bi])
+                                _t0[_bi] = np.where(_take, _t0[_bi + _nbr], _t0[_bi])
                         _y, _t0 = np.moveaxis(_y, 0, 1 + _gi), np.moveaxis(_t0, 0, 1 + _gi)
                 # walk the grouped axes: each combination of bins is one (line, frame) curve; x bins stay as the length axis
                 _combos = [((), _ln, _ai, None)]
@@ -1788,8 +1818,12 @@ def curve(
     _env = "max(y) over w" if MONOTONE else "y"
     _env_t = "arg_max(t_start, y) over w" if MONOTONE else "t_start"
     _env_src = "arg_max(src0, y) over w" if MONOTONE else "src0"
-    _env_window = (f"window w as (partition by series, fb, activity_id order by xb {'asc' if BAND_KIND.get(_x) == 'at_most' else 'desc'} rows between unbounded preceding and current row)"
-                   if MONOTONE else "")
+    _env_window = (
+        # gradient: each side of the pivot (in 1 % bins) from its own steep end
+        f"window w as (partition by series, fb, activity_id, xb < {round(GRADE_PIVOT)} order by case when xb < {round(GRADE_PIVOT)} then xb else -xb end rows between unbounded preceding and current row)"
+        if (MONOTONE and BAND_KIND.get(_x) == "two_sided") else
+        f"window w as (partition by series, fb, activity_id order by xb {'asc' if BAND_KIND.get(_x) == 'at_most' else 'desc'} rows between unbounded preceding and current row)"
+        if MONOTONE else "")
 
     # Frames: what the animation steps through. Each frame is a set of activities (a window, a year) or a band; every
     # frame's Best (with its effort), percentiles and count per line and length are computed here at once, so moving
@@ -1915,7 +1949,7 @@ def curve(
     CLOUD_IN = None if (AXES_CLASH or not FRAMES.height or _join is None) else {
         "per": _per, "env": MONOTONE, "join": _join, "frames": _frame_tbl, "kept": _kept,
         # and the frontier's: how activities fall into frames, the route, the bounds each line and band band adds
-        "kind": FRAME_KIND, "win": _win, "scan": SCAN, "filters": _filters,
+        "kind": FRAME_KIND, "win": _win, "scan": SCAN, "filters": _filters, "envw": _env_window,
         "lband": {_nm: _band_filter(_g, _b[0], _b[1]) for _nm, _b in _lbands} if (SCAN and _g in _ENGINE) else None,
         "aband": [_band_filter(_A, _b[1][0], _b[1][1]) for _b in _abands] if _abands else None,
     }
@@ -1982,6 +2016,7 @@ def curve(
         FRAME_KIND,
         FRAME_LABELS,
         FRAME_NOTE,
+        GRADE_PIVOT,
         LEGEND_TITLE,
         SERIES_COLORS,
         SERIES_ORDER,
@@ -2063,7 +2098,8 @@ def cloud(
         if _eff or _ci["env"]:
             # each activity's best at a length is the best held for at least that long, as the curve counts it
             _ysql = "max(y) over w as y, arg_max(t_start, y) over w as t_start, arg_max(src0, y) over w as src_xb"
-            _wsql = "window w as (partition by series, fb, activity_id order by xb desc rows between unbounded preceding and current row)"
+            _wsql = ("window w as (partition by series, fb, activity_id order by xb desc rows between unbounded preceding and current row)"
+                     if (_eff or not _ci.get("envw")) else _ci["envw"])
         else:
             _ysql, _wsql = "y, t_start, src0 as src_xb", ""
         con.execute(f"""
@@ -2199,6 +2235,7 @@ def efforts(
     DISPLAY_TIME,
     FRAMES,
     FRAME_LABELS,
+    GRADE_PIVOT,
     SERIES_ORDER,
     con,
     cur_table,
@@ -2229,14 +2266,17 @@ def efforts(
     _ci = CLOUD_IN
     _len_axis = x_axis.value in ("len_time", "len_dist")
     # time or distance into as x: the engine's dimension, engine units per display unit (min, mi), the cloud's grid step
-    INTO = {"tb": ("t0", 60.0, 1.0), "db": ("d0", 1609.344, 0.1), "hb": ("h", 1.0, 1.0)}
+    INTO = {"tb": ("t0", 60.0, 1.0), "db": ("d0", 1609.344, 0.1), "hb": ("h", 1.0, 1.0), "gb": ("g", 0.01, 1.0)}
+    INTO_X = None
     _into = x_axis.value in INTO and bool(BAND_KIND.get(x_axis.value))
     _want_best = lines_by.value == "none" or stat.value == "Best"
     if _ci is not None and (_len_axis or _into):
         if _into:
-            # Time into an activity as x: for windows of the Window control's length, the best among those starting at
-            # least T in. The engine reads it from every start of every activity (exact, no grid), as a staircase of
-            # efforts; x is in display units here (minutes, miles).
+            # A dimension with a harder direction as x: for windows of the Window control's length, the best among those
+            # at least as hard as x (later in, a lower heart rate, steeper). The engine reads it from every start of every
+            # activity (exact, no grid) as a staircase of efforts. Each branch of the axis is kept on its own "u" scale
+            # where harder is higher: u = x (time, distance into), u = -x (heart rate), and for gradient two branches from
+            # the easiest gradient p: u = x - p uphill, u = 1000 + (p - x) downhill. INTO_X tells the chart how to map back.
             _T = time.time()
             _bw, _nw = length.value
             _ym = y_axis.value
@@ -2246,12 +2286,20 @@ def efforts(
             _kept = {old: new for new, old in enumerate(_ci["kept"])} if _ci["kept"] is not None else None
             _epoch = dt.date(1970, 1, 1)
             _dim, _u, _step = INTO[x_axis.value]
-            # a smaller-is-harder dimension (heart rate) is mirrored here (u = -x), so the hard end is always the high end
-            _sg = -1.0 if BAND_KIND.get(x_axis.value) == "at_most" else 1.0
-            _dirn = "le" if _sg < 0 else "ge"
             _x0, _x1 = (float(v) for v in filters.value[x_axis.value])
-            _ua, _ub = sorted((_sg * _x0, _sg * _x1))
-            _grid = np.arange(np.floor(_ua / _step), np.ceil(_ub / _step) + 1)  # the cloud's grid, in steps
+            if BAND_KIND.get(x_axis.value) == "two_sided":
+                _pv = GRADE_PIVOT
+                # (direction, the branch's range of x, x -> u, effort index offset, u where it starts)
+                _branches = [("ge", (_pv, _x1), lambda x: x - _pv, 0, 0.0), ("le", (_x0, _pv), lambda x: 1000.0 + (_pv - x), 1000, 1000.0)]
+                INTO_X = {"p": _pv}
+            else:
+                _sg = -1.0 if BAND_KIND.get(x_axis.value) == "at_most" else 1.0
+                _branches = [("le" if _sg < 0 else "ge", (_x0, _x1), (lambda x: -x) if _sg < 0 else (lambda x: x), 0, min(_sg * _x0, _sg * _x1))]
+                INTO_X = {"sign": _sg}
+            _one = len(_branches) == 1
+            if _one:
+                _ua, _ub = sorted((_branches[0][2](_x0), _branches[0][2](_x1)))
+                _grid = np.arange(np.floor(_ua / _step), np.ceil(_ub / _step) + 1)  # the cloud's grid, in steps
             _out, _verts, _own, _rawp = [], [], [], []
             for (_series, _fb), _cell in _ci["per"].select("series", "fb", "activity_id", "d").unique().partition_by(["series", "fb"], as_dict=True).items():
                 _s = 0 if _sidx is None else _sidx.get(_series)
@@ -2271,64 +2319,71 @@ def efforts(
                     _fs = [int(_fb) if _kind == "band" else 0]
                     _sets = [list(range(len(_ids)))]
                 _sets = [st if (_kept is None or f in _kept) else [] for f, st in zip(_fs, _sets)]
-                # the view's filters, and starts within the axis's range (the time-into slider), as the bins hold them
-                _flt = list(_ci["filters"]) + [(_dim, _x0 * _u, _x1 * _u)]
-                if _ci["lband"] is not None and _series in _ci["lband"]:
-                    _flt.append(_ci["lband"][_series])
-                if _kind == "band" and _ci["aband"] is not None and int(_fb) < len(_ci["aband"]):
-                    _flt.append(_ci["aband"][int(_fb)])
-                _pidx = np.array([_index[a] for a in _ids], dtype=np.int64)
-                # each activity's own staircase (its own efforts, and its own frontier on the cloud's grid): the cloud's
-                # candidates and the field they are ranked in
-                _oe, _op = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, [[i] for i in range(len(_ids))], filters=_flt, direction=_dirn)
-                if len(_oe["set"]):
-                    _own.append(pl.DataFrame({
-                        "series": [_series] * len(_oe["set"]), "fb": [int(_fb)] * len(_oe["set"]), "activity_id": [_ids[int(r)] for r in _oe["row"]],
-                        "len": np.floor(_sg * _oe["x"] / _u / _step), "t0": _oe["t0"].astype(np.int64),
-                        "from_len": np.floor(_sg * _oe["from_x"] / _u / _step),
-                    }, schema_overrides={"series": pl.String, "fb": pl.Int32}).with_columns(pl.col("from_len").fill_nan(None)))
-                    for _si in range(len(_ids)):
-                        _m = _op["set"] == _si
-                        _px, _py = _sg * _op["x"][_m] / _u, _op["y"][_m]
-                        if not len(_px):
-                            continue
-                        # F at each grid x: the first staircase point at or after it (windows starting at least x in)
-                        _j = np.searchsorted(_px, _grid * _step, side="left")
-                        _ok = _j < len(_px)
-                        _rawp.append(pl.DataFrame({
-                            "series": [_series] * int(_ok.sum()), "fb": [int(_fb)] * int(_ok.sum()), "activity_id": [_ids[_si]] * int(_ok.sum()),
-                            "xb": _grid[_ok], "d": [_day[_ids[_si]]] * int(_ok.sum()), "y": _py[_j[_ok]].astype(np.float64),
-                            "t_start": (_px[_j[_ok]] * (_u if _dim == "t0" else 0)).astype(np.int64),
-                        }, schema_overrides={"series": pl.String, "fb": pl.Int32}))
-                if not _want_best:
-                    continue
-                _e, _p = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, _sets, filters=_flt, direction=_dirn)
-                if not len(_e["set"]):
-                    continue
                 _fmap = lambda si: (_kept[_fs[si]] if _kept is not None else _fs[si])
-                _out.append(pl.DataFrame({
-                    "f": [_fmap(int(si)) for si in _e["set"]], "s": [_s] * len(_e["set"]), "e": _e["effort"],
-                    "aid": [_ids[int(r)] for r in _e["row"]], "t0": _e["t0"], "len": _sg * _e["x"] / _u, "y": _e["y"],
-                    "from_len": _sg * _e["from_x"] / _u, "from_y": _e["from_y"],
-                }).cast(_E_SCHEMA).with_columns([pl.col(c).fill_nan(None) for c in ("y", "from_len", "from_y")]))
-                # the staircase as drawn: F(T) holds each point's value from the previous point up to it; points closer
-                # than a pixel column merge (an effort's last point always stays)
-                _P_ = pl.DataFrame({"si": _p["set"], "e": _p["effort"], "x": _sg * _p["x"] / _u, "y": _p["y"]})
-                for (_si,), _g in _P_.partition_by(["si"], as_dict=True).items():
-                    _rows = _g.rows()
-                    _dx = max((_rows[-1][2] - _ua) / 900.0, 1e-9)
-                    _last_of = {}
-                    for _k, _r in enumerate(_rows):
-                        _last_of[_r[1]] = _k
-                    _keep, _lx = [], None
-                    for _k, _r in enumerate(_rows):
-                        if _lx is None or _r[2] - _lx >= _dx or _last_of[_r[1]] == _k:
-                            _keep.append(_r)
-                            _lx = _r[2]
-                    _f, _o, _px = _fmap(int(_si)), 0, _ua
-                    for (_, _ee, _xx, _yy) in _keep:
-                        _verts += [(_f, _s, int(_ee), _o, _px, _yy), (_f, _s, int(_ee), _o + 1, _xx, _yy)]
-                        _o, _px = _o + 2, _xx
+                _pidx = np.array([_index[a] for a in _ids], dtype=np.int64)
+                for (_dirn, (_ra, _rb), _tou, _eoff, _ustart) in _branches:
+                    # the view's filters, and windows within the branch's range of x (as the bins hold them)
+                    _flt = list(_ci["filters"]) + [(_dim, _ra * _u, _rb * _u)]
+                    if _ci["lband"] is not None and _series in _ci["lband"]:
+                        _flt.append(_ci["lband"][_series])
+                    if _kind == "band" and _ci["aband"] is not None and int(_fb) < len(_ci["aband"]):
+                        _flt.append(_ci["aband"][int(_fb)])
+                    if _one:
+                        # each activity's own staircase (its own efforts, and its own frontier on the cloud's grid): the
+                        # cloud's candidates and the field they are ranked in
+                        _oe, _op = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, [[i] for i in range(len(_ids))], filters=_flt, direction=_dirn)
+                        if len(_oe["set"]):
+                            _own.append(pl.DataFrame({
+                                "series": [_series] * len(_oe["set"]), "fb": [int(_fb)] * len(_oe["set"]), "activity_id": [_ids[int(r)] for r in _oe["row"]],
+                                "len": np.floor(_tou(_oe["x"] / _u) / _step), "t0": _oe["t0"].astype(np.int64),
+                                "from_len": np.floor(_tou(_oe["from_x"] / _u) / _step),
+                            }, schema_overrides={"series": pl.String, "fb": pl.Int32}).with_columns(pl.col("from_len").fill_nan(None)))
+                            for _si in range(len(_ids)):
+                                _m = _op["set"] == _si
+                                _px, _py = _tou(_op["x"][_m] / _u), _op["y"][_m]
+                                if not len(_px):
+                                    continue
+                                # F at each grid x: the first staircase point at or after it (windows at least that hard)
+                                _j = np.searchsorted(_px, _grid * _step, side="left")
+                                _ok = _j < len(_px)
+                                _rawp.append(pl.DataFrame({
+                                    "series": [_series] * int(_ok.sum()), "fb": [int(_fb)] * int(_ok.sum()), "activity_id": [_ids[_si]] * int(_ok.sum()),
+                                    "xb": _grid[_ok], "d": [_day[_ids[_si]]] * int(_ok.sum()), "y": _py[_j[_ok]].astype(np.float64),
+                                    "t_start": (_px[_j[_ok]] * (_u if _dim == "t0" else 0)).astype(np.int64),
+                                }, schema_overrides={"series": pl.String, "fb": pl.Int32}))
+                    if not _want_best:
+                        continue
+                    _e, _p = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, _sets, filters=_flt, direction=_dirn)
+                    if not len(_e["set"]):
+                        continue
+                    _fl = _tou(_e["from_x"] / _u)
+                    if _ustart is not None and not _one:
+                        # a branch's first effort holds it from where the branch starts (the pivot)
+                        _fl = np.where(np.isnan(_fl), _ustart - 1e-9, _fl)
+                    _out.append(pl.DataFrame({
+                        "f": [_fmap(int(si)) for si in _e["set"]], "s": [_s] * len(_e["set"]), "e": _e["effort"] + _eoff,
+                        "aid": [_ids[int(r)] for r in _e["row"]], "t0": _e["t0"], "len": _tou(_e["x"] / _u), "y": _e["y"],
+                        "from_len": _fl, "from_y": _e["from_y"],
+                    }).cast(_E_SCHEMA).with_columns([pl.col(c).fill_nan(None) for c in ("y", "from_len", "from_y")]))
+                    # the staircase as drawn: F holds each point's value from the previous point up to it; points closer
+                    # than a pixel column merge (an effort's last point always stays)
+                    _P_ = pl.DataFrame({"si": _p["set"], "e": _p["effort"] + _eoff, "x": _tou(_p["x"] / _u), "y": _p["y"]})
+                    for (_si,), _g in _P_.partition_by(["si"], as_dict=True).items():
+                        _rows = _g.rows()
+                        _u0 = _ustart if _ustart is not None else _rows[0][2]
+                        _dx = max((_rows[-1][2] - _u0) / 900.0, 1e-9)
+                        _last_of = {}
+                        for _k, _r in enumerate(_rows):
+                            _last_of[_r[1]] = _k
+                        _keep, _lx = [], None
+                        for _k, _r in enumerate(_rows):
+                            if _lx is None or _r[2] - _lx >= _dx or _last_of[_r[1]] == _k:
+                                _keep.append(_r)
+                                _lx = _r[2]
+                        _f, _o, _px = _fmap(int(_si)), 0, _u0
+                        for (_, _ee, _xx, _yy) in _keep:
+                            _verts += [(_f, _s, int(_ee), _o, _px, _yy), (_f, _s, int(_ee), _o + 1, _xx, _yy)]
+                            _o, _px = _o + 2, _xx
             ACT_EFFORTS = pl.concat(_own) if _own else None
             EFFORT_RAW = pl.concat(_rawp) if _rawp else None
             if _out:
@@ -2517,6 +2572,7 @@ def efforts(
         EFFORT_CAPS,
         EFFORT_LINE,
         EFFORT_RAW,
+        INTO_X,
     )
 
 
@@ -2839,6 +2895,8 @@ def client_chart(
     FRAME_KIND,
     FRAME_LABELS,
     FRAME_NOW,
+    GRADE_PIVOT,
+    INTO_X,
     LEGEND_TITLE,
     SERIES_COLORS,
     SERIES_ORDER,
@@ -2918,6 +2976,12 @@ def client_chart(
             elif _x == "vb":
                 _xcalc = "(datum.xb + 0.5) * 0.2 * 2.23694" if _speedy else "26.8224 / ((datum.xb + 0.5) * 0.2)"
                 _xpy = (lambda b: (b + 0.5) * 0.2 * 2.23694) if _speedy else (lambda b: 26.8224 / ((b + 0.5) * 0.2))
+            elif BAND_KIND.get(_x) == "two_sided":
+                # 1 % bins: below the easiest gradient a bin holds windows at most its top, above it at least its start
+                _kb = round(GRADE_PIVOT)
+                _bw_ = 1.0
+                _xcalc = f"(datum.xb < {_kb} ? datum.xb + 1 : datum.xb)"
+                _xpy = lambda b: b + 1 if b < _kb else b
             elif BAND_KIND.get(_x) == "at_most":
                 # a bin holds windows at most its top (heart rate)
                 _bw_ = float(_w)
@@ -2934,7 +2998,7 @@ def client_chart(
                     _xv = [min(_xv), min(max(_xv), 30.0)]  # paces slower than 30:00 /mi are walking breaks
                 if BAND_KIND.get(_x) and EFFORTS.height:
                     # out to the Best's hardest effort (efforts are stored on the hard-is-high scale)
-                    _ev = [_sgn * float(v) for v in EFFORTS["len"]]
+                    _ev = [_ux_py(float(v)) for v in EFFORTS["len"]]
                     _xv = [min(min(_xv), min(_ev) - _bw_ / 2), max(max(_xv), max(_ev) + _bw_ / 2)]
                 return sorted(float(v) for v in _xv)
             _xtitle = {"tb": "Time into activity (min)", "db": "Distance into activity (mi)", "gb": "Gradient (%)", "pb": "Power (W)", "hb": "Heart rate (bpm)", "cb": f"Cadence ({CADENCE_UNIT[sport.value]})",
@@ -2948,6 +3012,22 @@ def client_chart(
         _xname = ("Duration" if _x == "len_time" else "Distance") if _len_axis else _xtitle.split(" (")[0]
         # efforts on a smaller-is-harder axis (heart rate) are stored mirrored (u = -x): flip them back for drawing
         _sgn = -1 if BAND_KIND.get(_x) == "at_most" else 1
+        # efforts on such an axis live on a "u" scale where harder is higher (efforts cell, INTO_X): back to x
+        _IX = INTO_X if (INTO_X is not None and EFFORTS.height) else None
+
+        def _ux(e):
+            if _IX is None:
+                return e
+            if _IX.get("p") is not None:
+                return f"({e} < 1000 ? {e} + {_IX['p']} : {_IX['p']} - ({e} - 1000))"
+            return f"({_IX['sign']} * {e})"
+
+        def _ux_py(v):
+            if _IX is None:
+                return v
+            if _IX.get("p") is not None:
+                return v + _IX["p"] if v < 1000 else _IX["p"] - (v - 1000)
+            return _IX["sign"] * v
         # y: one range for every frame (from frames with 3+ activities, trimmed), so motion on screen means change
         _yt = {"p": "Power (W)", "g": "Gradient (%)", "h": "Heart rate (bpm)", "a": "Vertical speed (ft/h)", "v": "Speed (mph)" if _speedy else "Pace (min/mi)",
                "c": f"Cadence ({CADENCE_UNIT[sport.value]})", "k": "Torque (N·m)", "l": "Step length (in)"}[_k]
@@ -3098,8 +3178,8 @@ def client_chart(
             _w = f"({_fr} - floor({_fr}))"
             _pf = f"datum.p == floor({_fr})"
             _sn = "[" + ", ".join(json.dumps(n) for n in SERIES_ORDER) + "][datum.s]" if (SERIES_ORDER and not _none) else "'Best'"
-            _iu = {"tb": (" min", ",.0f"), "db": (" mi", ",.1f"), "hb": (" bpm", ",.0f")}.get(_x) if BAND_KIND.get(_x) else None
-            _lenlab = (lambda e: f"format(abs({e}), '{_iu[1]}') + '{_iu[0]}'") if _iu else (lambda e: _xl.replace("datum.xb", e))
+            _iu = {"tb": (" min", ",.0f"), "db": (" mi", ",.1f"), "hb": (" bpm", ",.0f"), "gb": ("%", "+.1f")}.get(_x) if BAND_KIND.get(_x) else None
+            _lenlab = (lambda e: f"format({_ux(e)}, '{_iu[1]}') + '{_iu[0]}'") if _iu else (lambda e: _xl.replace("datum.xb", e))
             _lerp = f"isValid(datum.ya) && isValid(datum.yb) ? datum.ya + (datum.yb - datum.ya) * {_w} : isValid(datum.ya) ? ({_w} < 0.5 ? datum.ya : null) : ({_w} >= 0.5 ? datum.yb : null)"
             # on the log scale; exact at a whole frame, where a bar's ends must meet the line's points
             _glog = ((lambda a, b: f"({_w} == 0 ? {a} : exp(log({a}) + (log({b}) - log({a})) * {_w}))") if _len_axis
@@ -3114,10 +3194,11 @@ def client_chart(
             _ident = {
                 "series": _sn, "sname": _sn, "activity_id": "datum.aid", "t": "datum.t0", "src": "round(datum.elen)", "xb": "round(datum.elen)", "f": "datum.nf",
                 "on": "'e:' + datum.nf + ':' + datum.s + ':' + datum.aid + ':' + datum.t0 == kpick",
-                "full": (f"'{fmt_len(*length.value)} at ' + ({_lab(_yv('datum.ey'))}) + ', at ' + ({_lenlab('datum.elen')})" if (_iu and _sgn < 0)
+                "full": (f"'{fmt_len(*length.value)} at ' + ({_lab(_yv('datum.ey'))}) + ', at ' + ({_lenlab('datum.elen')})" if (_iu and (_sgn < 0 or _x == "gb"))
                          else f"'{fmt_len(*length.value)} at ' + ({_lab(_yv('datum.ey'))}) + ', starting ' + ({_lenlab('datum.elen')}) + ' in'" if _iu
                          else f"({_lenlab('datum.elen')}) + ' at ' + ({_lab(_yv('datum.ey'))})"),
-                "holds": (f"isValid(datum.efrom) && datum.efrom != 0 ? 'from ' + format(abs(datum.elen), '{_iu[1]}') + ' to ' + ({_lenlab('datum.efrom')}) : 'from ' + ({_lenlab('datum.elen')}) + ' up'" if (_iu and _sgn < 0)
+                "holds": (f"'between ' + format(min({_ux('datum.efrom')}, {_ux('datum.elen')}), '+.1f') + ' and ' + format(max({_ux('datum.efrom')}, {_ux('datum.elen')}), '+.1f') + '%'" if (_iu and _x == "gb")
+                          else f"isValid(datum.efrom) && datum.efrom != 0 ? 'from ' + format(abs(datum.elen), '{_iu[1]}') + ' to ' + ({_lenlab('datum.efrom')}) : 'from ' + ({_lenlab('datum.elen')}) + ' up'" if (_iu and _sgn < 0)
                           else f"isValid(datum.efrom) ? 'from ' + format(datum.efrom, '{_iu[1]}') + ' to ' + ({_lenlab('datum.elen')}) + ' in' : 'up to ' + ({_lenlab('datum.elen')}) + ' in'" if _iu
                           else f"isValid(datum.efrom) ? ({_lenlab('datum.efrom')}) + ' to ' + ({_lenlab('datum.elen')}) : 'up to ' + ({_lenlab('datum.elen')})"),
             }
@@ -3139,7 +3220,7 @@ def client_chart(
                 )
                 .transform_filter("(!isValid(datum.lo) || datum.x > datum.lo || (datum.x == datum.lo && datum.sd == 1)) && (datum.x < datum.hi || (datum.x == datum.hi && datum.sd == 0))")
                 .transform_calculate(yv=_yv("datum.yr"), **_ident)
-                .transform_calculate(x=f"{_sgn} * datum.x")
+                .transform_calculate(x=_ux("datum.x"))
                 .transform_calculate(bop="datum.op * (datum.on ? 0.45 : datum.bid % 2 ? 0.16 : 0.3)")
             )
             _tips = [alt.Tooltip("name:N", title="Activity"), alt.Tooltip("date:N", title="Date"), alt.Tooltip("full:N", title="Full window"),
@@ -3149,17 +3230,22 @@ def client_chart(
             _caps = (
                 alt.Chart(_caps_v).transform_filter(_pf).transform_calculate(**_near)
                 .transform_calculate(
-                    x=f"{_sgn} * (datum.ina && datum.inb ? {_glog('datum.len_a', 'datum.len_b')} : datum.na ? datum.len_a : datum.len_b)",
+                    x=_ux(f"(datum.ina && datum.inb ? {_glog('datum.len_a', 'datum.len_b')} : datum.na ? datum.len_a : datum.len_b)"),
                     yr=f"datum.ina && datum.inb ? datum.y_a + (datum.y_b - datum.y_a) * {_w} : datum.na ? datum.y_a : datum.y_b",
                 )
                 .transform_calculate(yv=_yv("datum.yr"), **_ident)
             )
-            _line = alt.Chart(EFFORT_LINE).transform_filter(_pf).transform_calculate(yr=_lerp).transform_filter("isValid(datum.yr)").transform_calculate(yv=_yv("datum.yr"), sname=_sn, x=f"{_sgn} * datum.x")
+            _line = alt.Chart(EFFORT_LINE).transform_filter(_pf).transform_calculate(yr=_lerp).transform_filter("isValid(datum.yr)").transform_calculate(yv=_yv("datum.yr"), sname=_sn, bk="datum.s + ':' + (datum.x >= 1000)", x=_ux("datum.x"))
             _hair = dict(color="#f97316", strokeWidth=1, strokeDash=[3, 3], opacity=0.45)
             _focus = _caps.transform_filter(f"datum.on && {_w} < 0.5")
-            return [
+            _pivot = []
+            if _IX is not None and _IX.get("p") is not None:
+                _pdf = pl.DataFrame({"x": [_IX["p"]], "t": [f"easiest {_IX['p']:+.0f}%"]})
+                _pivot = [alt.Chart(_pdf).mark_rule(color="#94a3b8", strokeDash=[4, 4], strokeWidth=1).encode(x=_X),
+                          alt.Chart(_pdf).mark_text(align="left", baseline="bottom", dx=4, dy=-4, fontSize=11, color="#64748b").encode(x=_X, y=alt.value(14), text="t:N")]
+            return _pivot + [
                 # the line and the dots under the bars, so a click on either reaches its bar
-                _line.mark_line(strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv"), order="o:Q", detail="s:N", color=line_color),
+                _line.mark_line(strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv"), order="o:Q", detail="bk:N", color=line_color),
                 _caps.mark_circle(size=42, clip=True).encode(x=_X, y=_Y("yv"), color=color if color is not None else alt.value("#08306b"),
                                                              opacity=alt.Opacity("op:Q", scale=None)),
                 _bars.mark_line(strokeWidth=9, strokeCap="round", strokeJoin="round", clip=True).encode(
@@ -3345,17 +3431,16 @@ def chart_view(
 
 @app.cell(hide_code=True)
 def key_nav(
-    BAND_KIND,
     CHART_GEN,
     EFFORTS,
     FRAMES,
     FRAME_DEFAULT,
     FRAME_NOW,
+    INTO_X,
     PICK_GEN,
     SERIES_ORDER,
     lines_by,
     set_pick,
-    x_axis,
 ):
     # Left and right arrows: the previous or next effort along the Best of the frame on screen (on a value axis, the next
     # point of the Best line with Lines: None), with or without an animation (up and down move the frames, in the page). The page reports the key here
@@ -3365,8 +3450,6 @@ def key_nav(
     # set it, and the drill-down follows.
     def _step(v):
         _dir = v.split(":")[0]
-        if BAND_KIND.get(x_axis.value) == "at_most" and EFFORTS.height:
-            _dir = {"next": "prev", "prev": "next"}.get(_dir, _dir)
         if _dir not in ("next", "prev"):
             return
         _fr = FRAME_NOW["i"] if FRAME_NOW["i"] is not None else FRAME_DEFAULT
@@ -3375,10 +3458,14 @@ def key_nav(
         if EFFORTS.height:
             # efforts: the line of the effort on show (the first line when none is)
             _s = SERIES_ORDER.index(_pk[0]) if (lines_by.value != "none" and _pk and _pk[0] in SERIES_ORDER) else 0
-            _rows = EFFORTS.filter((pl.col("f") == _fr) & (pl.col("s") == _s)).sort("len").rows(named=True)
+            # in the order they sit on screen (efforts of a mirrored or two-branch axis are stored on a "u" scale)
+            _ix = INTO_X or {}
+            _scr = ((lambda u: u + _ix["p"] if u < 1000 else _ix["p"] - (u - 1000)) if _ix.get("p") is not None
+                    else (lambda u: _ix.get("sign", 1) * u))
+            _rows = sorted(EFFORTS.filter((pl.col("f") == _fr) & (pl.col("s") == _s)).rows(named=True), key=lambda r: _scr(r["len"]))
             _name = SERIES_ORDER[_s] if lines_by.value != "none" else "Best"
             _key = lambda r: (_name, int(round(r["len"])), int(r["aid"]), int(r["t0"]), int(round(r["len"])))
-            _len = lambda r: r["len"]
+            _len = lambda r: _scr(r["len"])
             _at = None
             if len(_sp) == 5 and _sp[0] == "e" and _sp[1].isdigit() and int(_sp[1]) == _fr:
                 _at = next((i for i, r in enumerate(_rows) if r["aid"] == int(_sp[3]) and r["t0"] == int(_sp[4])), None)
