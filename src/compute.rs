@@ -282,7 +282,7 @@ pub fn activity(
 /// One metric of a window, as `eval` computes it (the same arithmetic, so the values are identical).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn eval_one(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis: Basis, sp: &Sport, m: usize) -> f64 {
+pub(crate) fn eval_one(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis: Basis, sp: &Sport, m: usize) -> f64 {
     match m {
         P => if s.cp.is_empty() { f64::NAN } else { (s.cp[j] - s.cp[i]) / dt },
         V => dd / dt,
@@ -395,7 +395,7 @@ pub fn activity_metric(segs: &[&Segment], basis: Basis, lengths: &[f64], m: usiz
 /// Whether a window passes every filter, evaluating only the filtered dimensions.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn passes(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: Basis, sp: &Sport, filters: &[Filter]) -> bool {
+pub(crate) fn passes(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, len: f64, basis: Basis, sp: &Sport, filters: &[Filter]) -> bool {
     filters.iter().all(|f| {
         f.pass(match f.dim {
             Dim::Metric(d) => eval_one(s, i, j, dt, dd, len, basis, sp, d),

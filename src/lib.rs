@@ -2,6 +2,7 @@
 
 pub mod compute;
 pub mod frontier;
+pub mod into;
 pub mod prep;
 
 use compute::{Basis, Dim, Filter, Group, M, METRICS};
@@ -153,6 +154,61 @@ impl Prepared {
         d.set_item("from_len", PyArray1::from_vec(py, eff.iter().map(|e| e.from_len).collect()))?;
         d.set_item("from_y", PyArray1::from_vec(py, eff.iter().map(|e| e.from_y).collect()))?;
         Ok(d)
+    }
+
+    /// The frontier over where a window starts: for windows of `length` (on `basis`), the best of `metric` among those
+    /// starting at least x into an activity, x being seconds (`dim` "t0") or metres ("d0") in, for each set of rows.
+    /// Exact: every start of every activity counts (windows passing `filters`). activities: the Prepared index of each
+    /// row. Returns (efforts, points). efforts: set, effort, row, t0 (start of its last staircase window, s into the
+    /// activity), x, y (that window's), from_x (it holds the frontier above this; NaN for the first), from_y (the
+    /// frontier just above from_x). points: the staircase (set, effort, x, y), ascending x within a set.
+    #[pyo3(signature = (basis, length, metric, dim, activities, sets, filters=vec![]))]
+    #[allow(clippy::too_many_arguments)]
+    fn frontier_into<'py>(
+        &self,
+        py: Python<'py>,
+        basis: &str,
+        length: f64,
+        metric: &str,
+        dim: &str,
+        activities: PyReadonlyArray1<'py, i64>,
+        sets: Vec<Vec<usize>>,
+        filters: Vec<(String, f64, f64)>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+        let basis = parse_basis(basis)?;
+        let m = METRICS.iter().position(|x| *x == metric).ok_or_else(|| PyValueError::new_err(format!("unknown metric {metric}")))?;
+        let dim = match dim {
+            "t0" => Dim::T0,
+            "d0" => Dim::D0,
+            d => return Err(PyValueError::new_err(format!("dim must be t0 or d0, not {d}"))),
+        };
+        let filters = parse_filters(filters)?;
+        let n_all = self.activity_ids.len();
+        let rows: Vec<usize> = activities
+            .as_slice()?
+            .iter()
+            .map(|&i| if i >= 0 && (i as usize) < n_all { Ok(i as usize) } else { Err(PyValueError::new_err(format!("activity index {i} out of range"))) })
+            .collect::<PyResult<_>>()?;
+        if sets.iter().flatten().any(|&r| r >= rows.len()) {
+            return Err(PyValueError::new_err("set refers to a row out of range"));
+        }
+        let by_act = self.by_act();
+        let (eff, pts) = py.allow_threads(|| into::all(&by_act, &rows, &sets, basis, length, m, dim, &filters, &self.sport));
+        let e = PyDict::new(py);
+        e.set_item("set", PyArray1::from_vec(py, eff.iter().map(|v| v.set as i64).collect()))?;
+        e.set_item("effort", PyArray1::from_vec(py, eff.iter().map(|v| v.effort as i64).collect()))?;
+        e.set_item("row", PyArray1::from_vec(py, eff.iter().map(|v| v.row as i64).collect()))?;
+        e.set_item("t0", PyArray1::from_vec(py, eff.iter().map(|v| v.t0).collect()))?;
+        e.set_item("x", PyArray1::from_vec(py, eff.iter().map(|v| v.x).collect()))?;
+        e.set_item("y", PyArray1::from_vec(py, eff.iter().map(|v| v.y).collect()))?;
+        e.set_item("from_x", PyArray1::from_vec(py, eff.iter().map(|v| v.from_x).collect()))?;
+        e.set_item("from_y", PyArray1::from_vec(py, eff.iter().map(|v| v.from_y).collect()))?;
+        let p = PyDict::new(py);
+        p.set_item("set", PyArray1::from_vec(py, pts.iter().map(|v| v.0 as i64).collect()))?;
+        p.set_item("effort", PyArray1::from_vec(py, pts.iter().map(|v| v.1 as i64).collect()))?;
+        p.set_item("x", PyArray1::from_vec(py, pts.iter().map(|v| v.2).collect()))?;
+        p.set_item("y", PyArray1::from_vec(py, pts.iter().map(|v| v.3).collect()))?;
+        Ok((e, p))
     }
 
     /// Best of each metric per activity and length.
