@@ -78,6 +78,48 @@ def test_distance_into_holds_at_least_d(P):
         assert np.nanmax(best[:, 0, M["v"]]) == pytest.approx(y, rel=1e-6)
 
 
+def per_start_xy(P, basis, length, xm, ym, rows):
+    """Every start's own window: (row, its x metric, its y metric)."""
+    edges = np.arange(0, 3200, dtype=float)
+    y, _ = P.compute(basis, np.array([float(length)]), group=("t0", edges), activities=np.array(rows, dtype=np.int64))
+    out = []
+    for r in range(len(rows)):
+        for b in range(len(edges) - 1):
+            xv, yv = y[r, b, 0, M[xm]], y[r, b, 0, M[ym]]
+            if not (np.isnan(xv) or np.isnan(yv)):
+                out.append((r, float(xv), float(yv)))
+    return out
+
+
+@pytest.mark.parametrize("direction", ["le", "ge"])
+def test_metric_dimension_both_directions(P, direction):
+    """x is the window's own heart rate: the best pace among windows at most (le) or at least (ge) that heart rate."""
+    rows = [0, 1, 2]
+    pts = per_start_xy(P, "time", 300, "h", "v", rows)
+    s = -1 if direction == "le" else 1
+    e, p = P.frontier_into("time", 300.0, "v", "h", np.array(rows, dtype=np.int64), [rows], direction=direction)
+    got = list(zip(p["x"].tolist(), p["y"].tolist()))
+    assert len(got) >= 3
+    hx = np.array([s * x for _, x, _ in pts])  # the reference's x is float32: compare with a margin
+    hy = np.array([y for _, _, y in pts])
+    tol = 1e-3
+    for gx, gy in got:
+        # on the staircase: no strictly harder window is faster
+        harder = hx > s * gx + tol
+        assert not np.any(hy[harder] > gy + 1e-5)
+        # and it is a real window
+        assert np.any((np.abs(hx - s * gx) <= tol) & (np.abs(hy - gy) <= 1e-5))
+    # every window is covered: some staircase point at least as hard is at least as fast
+    gx_ = np.array([s * x for x, _ in got]); gy_ = np.array([y for _, y in got])
+    for x, y in zip(hx, hy):
+        assert np.any((gx_ >= x - tol) & (gy_ >= y - 1e-5))
+    # efforts come out in the dimension's own sense
+    if direction == "le":
+        assert all(a > b for a, b in zip(e["x"][:-1], e["x"][1:]))
+
+
 def test_bad_dim(P):
     with pytest.raises(ValueError):
-        P.frontier_into("time", 60.0, "v", "g", np.array([0], dtype=np.int64), [[0]])
+        P.frontier_into("time", 60.0, "v", "zz", np.array([0], dtype=np.int64), [[0]])
+    with pytest.raises(ValueError):
+        P.frontier_into("time", 60.0, "v", "h", np.array([0], dtype=np.int64), [[0]], direction="up")

@@ -1,7 +1,11 @@
-//! The frontier over where a window starts: for windows of one length, the best of a metric among windows starting at
-//! least T into an activity (time, `t0`) or D metres into it (`d0`), as a function of T or D. Later is harder, so this is
-//! a staircase read from the far end: a window is on it when it beats every window starting later. It is exact: every
-//! start of every activity is a candidate.
+//! The frontier over a property of windows: for windows of one length, the best of a metric among windows at least as
+//! hard as x on a dimension with a harder direction, as a function of x. The dimension is where a window starts (seconds
+//! or metres in, `t0`/`d0`: later is harder) or one of the window's own metrics (heart rate: lower is harder for the
+//! same pace or power; gradient: steeper). It is a staircase read from the hard end: a window is on it when it beats
+//! every window that is harder still. It is exact: every start of every activity is a candidate.
+//!
+//! Direction `Ge` means larger x is harder; `Le` means smaller x is harder (the dimension is mirrored inside, so the
+//! same staircase applies, and mirrored back on the way out).
 //!
 //! Consecutive staircase points from one activity whose windows overlap in time are one **effort**: it holds the
 //! frontier from the previous effort's last start (exclusive) up to its own last start.
@@ -21,14 +25,18 @@ struct Win {
 
 /// One activity's windows of `len` that pass the filters and are on its own staircase (beaten by no later start),
 /// in ascending x. A window dominated within its activity is dominated in any set containing it.
-fn own_staircase(segs: &[&Segment], basis: Basis, len: f64, m: usize, dim: Dim, filters: &[Filter], sp: &Sport) -> Vec<Win> {
+#[allow(clippy::too_many_arguments)]
+fn own_staircase(segs: &[&Segment], basis: Basis, len: f64, m: usize, dim: Dim, sign: f64, filters: &[Filter], sp: &Sport) -> Vec<Win> {
     let mut all: Vec<Win> = Vec::new();
     for s in segs {
         let n = s.n();
-        let x_of = |i: usize| match dim {
-            Dim::T0 => s.t_off + i as f64,
-            Dim::D0 => s.d_off + s.cd[i],
-            Dim::Metric(_) => f64::NAN,
+        // the window's x, mirrored for a smaller-is-harder dimension
+        let x_of = |i: usize, j: usize, dt: f64, dd: f64| {
+            sign * match dim {
+                Dim::T0 => s.t_off + i as f64,
+                Dim::D0 => s.d_off + s.cd[i],
+                Dim::Metric(d) => eval_one(s, i, j, dt, dd, len, basis, sp, d),
+            }
         };
         match basis {
             Basis::Time => {
@@ -41,8 +49,9 @@ fn own_staircase(segs: &[&Segment], basis: Basis, len: f64, m: usize, dim: Dim, 
                     let dd = s.cd[j] - s.cd[i];
                     if passes(s, i, j, len, dd, len, basis, sp, filters) {
                         let y = eval_one(s, i, j, len, dd, len, basis, sp, m) as f32;
-                        if !y.is_nan() {
-                            all.push(Win { x: x_of(i), y, t0: s.t_off + i as f64, t1: s.t_off + j as f64 });
+                        let x = x_of(i, j, len, dd);
+                        if !y.is_nan() && !x.is_nan() {
+                            all.push(Win { x, y, t0: s.t_off + i as f64, t1: s.t_off + j as f64 });
                         }
                     }
                 }
@@ -66,8 +75,9 @@ fn own_staircase(segs: &[&Segment], basis: Basis, len: f64, m: usize, dim: Dim, 
                     let dt = (j - i) as f64;
                     if passes(s, i, j, dt, len, len, basis, sp, filters) {
                         let y = eval_one(s, i, j, dt, len, len, basis, sp, m) as f32;
-                        if !y.is_nan() {
-                            all.push(Win { x: x_of(i), y, t0: s.t_off + i as f64, t1: s.t_off + j as f64 });
+                        let x = x_of(i, j, dt, len);
+                        if !y.is_nan() && !x.is_nan() {
+                            all.push(Win { x, y, t0: s.t_off + i as f64, t1: s.t_off + j as f64 });
                         }
                     }
                 }
@@ -99,11 +109,12 @@ pub struct IntoEffort {
     pub set: usize,
     pub effort: usize,
     pub row: usize,
-    /// its last staircase window: start (s into the activity), x, value
+    /// its hardest staircase window: start (s into the activity), x, value
     pub t0: i32,
     pub x: f64,
     pub y: f32,
-    /// it holds the frontier for x above this (the previous effort's last x; NaN for the first), at from_y just above
+    /// it holds the frontier from this x (the previous effort's hardest x, exclusive; NaN for the first) to its own, at
+    /// from_y next to it
     pub from_x: f64,
     pub from_y: f32,
 }
@@ -119,11 +130,13 @@ pub fn all(
     len: f64,
     m: usize,
     dim: Dim,
+    larger_is_harder: bool,
     filters: &[Filter],
     sp: &Sport,
 ) -> (Vec<IntoEffort>, Vec<(usize, usize, f64, f32)>) {
+    let sign = if larger_is_harder { 1.0 } else { -1.0 };
     // each activity's own staircase once, shared by every set it is in
-    let own: Vec<Vec<Win>> = rows.par_iter().map(|&a| own_staircase(&by_act[a], basis, len, m, dim, filters, sp)).collect();
+    let own: Vec<Vec<Win>> = rows.par_iter().map(|&a| own_staircase(&by_act[a], basis, len, m, dim, sign, filters, sp)).collect();
     let per_set: Vec<(Vec<IntoEffort>, Vec<(usize, usize, f64, f32)>)> = sets
         .par_iter()
         .enumerate()
@@ -164,11 +177,16 @@ pub fn all(
             (eff, pts)
         })
         .collect();
+    // back to the dimension's own sense (a mirrored dimension's points come out in descending x)
     let mut e_out = Vec::new();
     let mut p_out = Vec::new();
     for (e, p) in per_set {
-        e_out.extend(e);
-        p_out.extend(p);
+        e_out.extend(e.into_iter().map(|mut v| {
+            v.x *= sign;
+            v.from_x *= sign;
+            v
+        }));
+        p_out.extend(p.into_iter().map(|(a, b, x, y)| (a, b, x * sign, y)));
     }
     (e_out, p_out)
 }
