@@ -36,3 +36,9 @@ uv pip install -p .venv pytest && .venv/bin/python -m pytest tests
 ## Benchmark
 
 `bench/current_cube.py` times the notebook's own `build_cube` against the host's Garmin snapshot (into `out/current`). `bench/bench.py` builds the curves, compares them with that cube, and times single-activity updates and a two-sided gradient band. `HR_BRIDGE` sets the heart-rate bridging limit and `RAYON_NUM_THREADS` the thread count.
+
+## License
+
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md) (FSL-1.1-ALv2). You may use, modify and self-host it for any purpose except offering a competing commercial product or service; each release becomes available under Apache-2.0 two years after it ships.
+
+Outside contributions require agreeing to a contributor license agreement; open an issue before sending a pull request.
