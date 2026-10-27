@@ -1,0 +1,14 @@
+[project]
+name = "notebook"
+version = "0.1.0"
+description = "Built in marimohub"
+requires-python = ">=3.13"
+dependencies = [
+    "altair>=6.3.0",
+    "duckdb>=2.0.0",
+    "effort-curves @ https://github.com/justmytwospence/effort-curves/releases/download/v0.3.0/effort_curves-0.3.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "marimo-studio==0.4.1",
+    "numpy>=2.5.4",
+    "polars>=2.0.0",
+    "pyarrow>=26.0.0",
+]

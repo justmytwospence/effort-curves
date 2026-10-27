@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Data cubes</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script
+      src="https://cdn.jsdelivr.net/npm/@unocss/runtime@66.10.5/uno.global.js"
+      integrity="sha384-iX+gEyr2u+Tmd8XxbySu2iimH7dOfTZn9xahADx38mJHYzAI2CJUCo5+PPGOSU2b"
+      crossorigin="anonymous"
+    ></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/iconify-icon@3.0.3/dist/iconify-icon.min.js"
+      integrity="sha384-jypoV+nlFXLykSFUJkpVjPG/eid90inFxyvUI1corcUR778eMGexPBFzNC94eOc+"
+      crossorigin="anonymous"
+    ></script>
+    <style>
+      :root {
+        --ink: #0f172a;
+        --muted: #64748b;
+        --line: #e5e7eb;
+        --paper: #f3f4f6;
+        --card: #ffffff;
+        --accent: #1f4e9c;
+        --bar: 44px;
+        --gap: 0px;
+      }
+      html, body {
+        height: 100%;
+        margin: 0;
+        overflow: hidden; /* one screen, no page scroll */
+        background: var(--card);
+        color: var(--ink);
+        font-family: Inter, system-ui, sans-serif;
+      }
+      marimo-cell, marimo-output {
+        --marimo-cell-font: Inter, system-ui, sans-serif;
+        --marimo-cell-heading-font: Inter, system-ui, sans-serif;
+        --marimo-cell-foreground: var(--ink);
+        --marimo-cell-accent: var(--accent);
+        --marimo-cell-font-size: 13px;
+        display: block;
+      }
+      #app-shell {
+        height: 100vh;
+        display: grid;
+        grid-template-rows: var(--bar) minmax(0, 1fr);
+      }
+      .topbar {
+        background: #0b1220;
+        color: #e5e7eb;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 16px;
+        min-width: 0;
+      }
+      .brand {
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+      }
+      .divider {
+        width: 1px;
+        height: 18px;
+        background: rgba(255, 255, 255, 0.18);
+      }
+      #title {
+        font-weight: 600;
+        color: #fff;
+        white-space: nowrap;
+      }
+      #meta {
+        color: #94a3b8;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .ghost {
+        margin-left: auto;
+        background: transparent;
+        color: #cbd5e1;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 8px;
+        padding: 5px 10px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .ghost:hover {
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .body {
+        display: grid;
+        grid-template-columns: 290px minmax(0, 1fr);
+        gap: var(--gap);
+        padding: var(--gap);
+        min-height: 0;
+      }
+      .panel {
+        background: var(--card);
+        border: 0;
+        border-radius: 0;
+        min-height: 0;
+        min-width: 0;
+      }
+      .rail {
+        border-right: 1px solid var(--line);
+        background: #fafbfc;
+        overflow-y: auto;
+        padding: 12px 14px;
+        scrollbar-width: thin;
+      }
+      .rail marimo-output {
+        --marimo-cell-font-size: 13px;
+        zoom: 0.8; /* marimo draws controls at editor size; this suits a 290 px rail */
+      }
+      .main {
+        display: flex;
+        flex-direction: column;
+        gap: var(--gap);
+        min-height: 0;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .curve {
+        padding: 8px 14px 0;
+        overflow: hidden;
+        flex: 1 1 0;
+        min-height: 0;
+      }
+      /* the drill-down appears under the chart only while a point is picked; the chart re-renders shorter */
+      .drill {
+        flex: 1 1 0;
+        min-height: 0;
+        border-top: 1px solid var(--line);
+        padding: 8px 14px;
+        overflow: hidden;
+        display: none;
+      }
+      .drill.open {
+        display: block;
+      }
+      /* collapsible controls rail */
+      /* one column: a display:none rail leaves the grid, so a 0-width first column would swallow the main area */
+      body.rail-hidden .body {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      body.rail-hidden .rail {
+        display: none;
+      }
+      .icon-btn {
+        background: transparent;
+        color: #cbd5e1;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 8px;
+        padding: 4px 7px;
+        cursor: pointer;
+        line-height: 1;
+      }
+      .hide-btn {
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 2px 8px;
+        font: inherit;
+        font-size: 12px;
+        color: var(--muted);
+        cursor: pointer;
+      }
+      .hide-btn:hover {
+        background: var(--paper);
+      }
+      body.rail-hidden #rail-toggle {
+        background: rgba(255, 255, 255, 0.14);
+        color: #fff;
+      }
+      .icon-btn:hover {
+        background: rgba(255, 255, 255, 0.08);
+      }
+      /* loading skeletons shaped like what they stand in for (replace Studio's generic text-line skeleton) */
+      @keyframes pulse { 50% { opacity: 0.55; } }
+      .curve marimo-output[value="chart_view"]:empty::before {
+        content: "";
+        display: block;
+        block-size: calc(100vh - var(--bar) - 16px);
+        border-radius: 6px;
+        /* a chart, sketched: a shimmer passing over the axes, tick labels, axis titles, gridlines and a curve */
+        background:
+          linear-gradient(100deg, transparent 0 40%, rgba(255, 255, 255, 0.7) 50%, transparent 60% 100%) 150% 0 / 200% 100% no-repeat,
+          url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%201000%20400%27%20preserveAspectRatio%3D%27none%27%3E%20%3Cg%20stroke%3D%27%23eef2f7%27%20stroke-width%3D%271%27%20vector-effect%3D%27non-scaling-stroke%27%20fill%3D%27none%27%3E%20%3Cpath%20d%3D%27M0%2080H1000M0%20160H1000M0%20240H1000M0%20320H1000%27%20vector-effect%3D%27non-scaling-stroke%27/%3E%20%3Cpath%20d%3D%27M166%200V400M333%200V400M500%200V400M666%200V400M833%200V400%27%20vector-effect%3D%27non-scaling-stroke%27/%3E%20%3C/g%3E%20%3Cpath%20d%3D%27M0%2062%20C%20220%2074%20480%2096%20700%20128%20C%20820%20146%20900%20196%20960%20300%20L%201000%20372%20L%201000%20400%20L%20940%20400%20C%20880%20330%20800%20262%20700%20236%20C%20480%20196%20240%20170%200%20156%20Z%27%20fill%3D%27%231f4e9c%27%20fill-opacity%3D%270.07%27/%3E%20%3Cpath%20d%3D%27M0%2084%20C%20230%2098%20480%20120%20700%20156%20C%20820%20176%20895%20226%20950%20320%20L%20990%20400%20L%20960%20400%20C%20900%20318%20810%20250%20700%20214%20C%20480%20172%20240%20148%200%20134%20Z%27%20fill%3D%27%231f4e9c%27%20fill-opacity%3D%270.08%27/%3E%20%3Cpath%20d%3D%27M0%20110%20C%20240%20124%20480%20146%20700%20186%20C%20815%20206%20890%20262%20945%20360%27%20fill%3D%27none%27%20stroke%3D%27%23cbd5e1%27%20stroke-width%3D%272%27%20vector-effect%3D%27non-scaling-stroke%27/%3E%20%3Cpath%20d%3D%27M0%2050%20C%20220%2062%20480%2084%20700%20114%20C%20820%20132%20905%20182%20965%20288%20L%201000%20352%27%20fill%3D%27none%27%20stroke%3D%27%231f4e9c%27%20stroke-opacity%3D%270.28%27%20stroke-width%3D%272.5%27%20vector-effect%3D%27non-scaling-stroke%27/%3E%20%3C/svg%3E") 56px 18px / calc(100% - 74px) calc(100% - 62px) no-repeat,
+          linear-gradient(#cbd5e1, #cbd5e1) 54px 18px / 1.5px calc(100% - 61px) no-repeat,
+          linear-gradient(#cbd5e1, #cbd5e1) 54px calc(100% - 44px) / calc(100% - 72px) 1.5px no-repeat,
+          repeating-linear-gradient(transparent 0 26px, #e2e8f0 26px 34px, transparent 34px 72px) 18px 18px / 28px calc(100% - 70px) no-repeat,
+          repeating-linear-gradient(90deg, transparent 0 96px, #e2e8f0 96px 124px, transparent 124px 150px) 56px calc(100% - 32px) / calc(100% - 74px) 8px no-repeat,
+          linear-gradient(#e2e8f0, #e2e8f0) 50% calc(100% - 8px) / 88px 9px no-repeat,
+          linear-gradient(#e2e8f0, #e2e8f0) 2px 50% / 9px 84px no-repeat;
+        animation: chart-shimmer 1.8s ease-in-out infinite;
+      }
+      @keyframes chart-shimmer {
+        0% { background-position: 150% 0, 56px 18px, 54px 18px, 54px calc(100% - 44px), 18px 18px, 56px calc(100% - 32px), 50% calc(100% - 8px), 2px 50%; }
+        100% { background-position: -50% 0, 56px 18px, 54px 18px, 54px calc(100% - 44px), 18px 18px, 56px calc(100% - 32px), 50% calc(100% - 8px), 2px 50%; }
+      }
+      /* above the chart: its own controls on the left, the animation's Play bar on the right */
+      .curve { position: relative; }
+      .curve-head { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; padding: 0 48px 6px 0; }
+      .curve-head:not(:has(*:not([hidden]))) { display: none; }
+      .live-bar {
+        margin-left: auto;
+        display: flex; align-items: center; gap: 6px;
+        font-size: 12px; color: var(--muted);
+        background: rgba(255, 255, 255, 0.92); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px;
+      }
+      .live-bar[hidden] { display: none; }
+      .live-bar .scrub { display: flex; align-items: center; gap: 8px; margin-left: 4px; }
+      .live-bar .scrub-title { font-weight: 600; color: var(--ink); }
+      .live-bar .scrub-track { display: flex; flex-direction: column; width: 260px; }
+      .live-bar .scrub-track input { width: 100%; margin: 0; accent-color: #1e3a8a; cursor: pointer; }
+      .live-bar .scrub-ends { display: flex; justify-content: space-between; font-size: 10px; line-height: 1.1; color: #94a3b8; }
+      .live-bar .scrub-now { min-width: 150px; font-weight: 600; color: #1e3a8a; white-space: nowrap; }
+      .live-bar button {
+        display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 4px;
+        background: #fff; padding: 2px 8px; font: inherit; color: var(--ink); cursor: pointer;
+      }
+      .live-bar button:hover { background: #f1f5f9; }
+      .live-bar select { font: inherit; border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; background: #fff; }
+      .rail marimo-output[value="controls_panel"]:empty::before {
+        content: "";
+        display: block;
+        block-size: 560px;
+        /* label | widget rows, matching the control rows */
+        background:
+          repeating-linear-gradient(transparent 0 6px, #e2e8f0 6px 16px, transparent 16px 44px) 0 0 / 27% 100% no-repeat,
+          repeating-linear-gradient(transparent 0 0, #f1f5f9 0 30px, transparent 30px 44px) 31% 0 / 69% 100% no-repeat;
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      #drill-fit marimo-cell:empty::before {
+        content: "";
+        display: block;
+        inline-size: 1550px;
+        block-size: 470px;
+        /* header line, three stacked stream panels, square map on the right */
+        background:
+          linear-gradient(#e2e8f0, #e2e8f0) 0 0 / 420px 16px no-repeat,
+          linear-gradient(#f1f5f9, #f1f5f9) 0 40px / 1090px 128px no-repeat,
+          linear-gradient(#f1f5f9, #f1f5f9) 0 178px / 1090px 128px no-repeat,
+          linear-gradient(#f1f5f9, #f1f5f9) 0 316px / 1090px 128px no-repeat,
+          linear-gradient(#e8edf3, #e8edf3) 1120px 40px / 430px 430px no-repeat;
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      #title[aria-busy="true"] {
+        color: transparent;
+        background: rgba(255, 255, 255, 0.14);
+        border-radius: 4px;
+        min-width: 180px;
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      /* fixed-size content (the drill-down's linked chart) scales down to fit its panel */
+      .fit {
+        transform-origin: top left;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      dialog {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 0;
+        width: min(860px, 92vw);
+        max-height: 86vh;
+        box-shadow: 0 24px 64px rgba(15, 23, 42, 0.25);
+      }
+      dialog::backdrop {
+        background: rgba(15, 23, 42, 0.35);
+      }
+      .dialog-body {
+        padding: 18px 20px;
+        overflow-y: auto;
+        max-height: calc(86vh - 52px);
+      }
+      .dialog-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 16px 12px 20px;
+        border-bottom: 1px solid var(--line);
+        font-weight: 600;
+      }
+      .close {
+        background: transparent;
+        border: 0;
+        cursor: pointer;
+        font-size: 18px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main id="app-shell">
+      <header class="topbar" aria-label="Summary" data-marimo-lens-inputs="headline-data" data-marimo-lens-label="Title and date range">
+        <span id="headline-data" hidden mo-value="headline"></span>
+        <button class="icon-btn flex items-center gap-1" type="button" id="rail-toggle" aria-label="Show or hide controls" title="Show or hide controls">
+          <iconify-icon icon="lucide:panel-left" aria-hidden="true"></iconify-icon>
+          <span class="text-xs">Controls</span>
+        </button>
+        <span class="brand flex items-center gap-2">
+          <iconify-icon inline icon="lucide:boxes" aria-hidden="true"></iconify-icon>
+          Data cubes
+        </span>
+        <span class="divider" aria-hidden="true"></span>
+        <span id="title" aria-busy="true">Loading…</span>
+        <span id="meta"></span>
+        <button class="ghost flex items-center gap-1" type="button" id="about-open">
+          <iconify-icon inline icon="lucide:info" aria-hidden="true"></iconify-icon>
+          About
+        </button>
+      </header>
+
+      <div class="body">
+        <aside class="panel rail" aria-label="Controls">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-semibold uppercase tracking-wider" style="color: var(--muted)">Controls</span>
+            <button class="hide-btn flex items-center gap-1" type="button" id="rail-hide" aria-label="Hide controls">
+              <iconify-icon inline icon="lucide:panel-left-close" aria-hidden="true"></iconify-icon>
+              Hide
+            </button>
+          </div>
+          <marimo-output value="controls_panel"></marimo-output>
+        </aside>
+
+        <div class="main">
+          <div aria-hidden="true" style="position:absolute;left:-9999px;top:0;width:200px;height:40px;overflow:hidden;opacity:0;pointer-events:none"><marimo-output value="viewport" id="viewport-host"></marimo-output></div>
+          <section class="panel curve" aria-label="Curve">
+            <!-- the frame on screen (100000 + frame number): written by the sidebar's scrubber and the Play button, read by the chart -->
+            <input type="hidden" id="live-win" value="">
+            <!-- the point the drill-down shows (frame * 100000 + length, -1 for none): read by the chart's ring -->
+            <input type="hidden" id="pick-key" value="-1">
+            <!-- a stretch dragged on the drill-down: its start and end (elapsed minutes), and its point for the chart -->
+            <input type="hidden" id="bs" value=""><input type="hidden" id="hm" value=""><input type="hidden" id="brush-win" value=""><input type="hidden" id="brush-dot" value="">
+            <span id="live-data" hidden mo-value="LIVE_INFO"></span>
+            <!-- the chart's own controls (left) and the animation's Play bar (right), above the chart -->
+            <div class="curve-head" id="curve-head">
+            <marimo-output value="chart_controls" id="chart-tools"></marimo-output>
+            <div class="live-bar" id="live-bar" hidden>
+              <button type="button" id="live-play" aria-label="Play">
+                <iconify-icon inline icon="lucide:play" id="live-play-icon" aria-hidden="true"></iconify-icon><span id="live-play-label">Play</span>
+              </button>
+              <select id="live-speed" aria-label="Speed">
+                <option value="900">Slow</option>
+                <option value="400" selected>Normal</option>
+                <option value="150">Fast</option>
+              </select>
+              <span class="scrub">
+                <span class="scrub-title" id="live-title"></span>
+                <span class="scrub-track">
+                  <input type="range" id="live-scrub" aria-label="Frame" min="100000" max="100000" step="1" value="100000">
+                  <span class="scrub-ends"><span id="live-first"></span><span id="live-last"></span></span>
+                </span>
+                <span class="scrub-now" id="live-now"></span>
+              </span>
+            </div>
+            </div>
+            <!-- where the page reports the animation's frame to the notebook, when the scrubber is let go or Play stops -->
+            <div aria-hidden="true" style="position:absolute;left:-9999px;top:0;width:200px;height:40px;overflow:hidden;opacity:0;pointer-events:none"><marimo-output value="frame_report" id="frame-report-host"></marimo-output><marimo-output value="key_report" id="key-report-host"></marimo-output><marimo-output value="brush_report" id="brush-report-host"></marimo-output><marimo-cell name="brush_dot_cell" id="brush-dot-host"></marimo-cell></div>
+            <marimo-output value="chart_view"></marimo-output>
+          </section>
+          <section class="panel drill" id="drawer" aria-label="Drill-down" data-marimo-lens-inputs="drill-key">
+            <span id="drill-key" hidden mo-value="drill_key"></span>
+            <div class="fit" id="drill-fit">
+              <marimo-cell name="drill"></marimo-cell>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <dialog id="about" aria-label="About and data">
+        <div class="dialog-head">
+          <span>About the cube</span>
+          <button class="close" type="button" id="about-close" aria-label="Close">
+            <iconify-icon icon="lucide:x"></iconify-icon>
+          </button>
+        </div>
+        <div class="dialog-body grid gap-4">
+          <marimo-output value="ABOUT_MD"></marimo-output>
+          <marimo-output value="rebuild"></marimo-output>
+          <marimo-output value="excluded_view"></marimo-output>
+        </div>
+      </dialog>
+    </main>
+
+    <script type="module">
+      /** Subscribe an explicit `mo-value` host to current values and later updates. */
+      const observeMarimoValue = (host, { onValue, onError = () => {} }) => {
+        const sync = (event) => onValue(event.detail.value);
+        const fail = (event) => onError(event.detail);
+        host.addEventListener("marimo-value-updated", sync);
+        host.addEventListener("marimo-value-error", fail);
+        if (host.dataset.marimoError !== undefined) {
+          onError({
+            selector: host.getAttribute("mo-value")?.trim() ?? "",
+            code: host.dataset.marimoErrorCode,
+            message: host.dataset.marimoError,
+            hint: host.dataset.marimoDiagnosticHint,
+          });
+        } else if (host.marimoValue !== undefined) {
+          onValue(host.marimoValue);
+        }
+        return () => {
+          host.removeEventListener("marimo-value-updated", sync);
+          host.removeEventListener("marimo-value-error", fail);
+        };
+      };
+
+      const title = document.getElementById("title");
+      const meta = document.getElementById("meta");
+      const source = document.getElementById("headline-data");
+      if (source) {
+        const stop = observeMarimoValue(source, {
+          onValue: (h) => {
+            title.textContent = h.title;
+            title.removeAttribute("aria-busy");
+            meta.textContent = `${h.window} · ${h.activities.toLocaleString()} activities · click a point on the Best line to see where it happened`;
+          },
+          onError: (error) => { title.textContent = `Unavailable: ${error.message}`; },
+        });
+        window.addEventListener("pagehide", stop, { once: true });
+      }
+
+      const fit = document.getElementById("drill-fit");
+      const frame = fit.parentElement;
+      let autoHidden = false;
+      let closedKey = null;
+      // drill-down panel: shown while the notebook has a picked point
+      const drawer = document.getElementById("drawer");
+      const keyHost = document.getElementById("drill-key");
+      if (keyHost) {
+        const stopKey = observeMarimoValue(keyHost, {
+          onValue: (k) => {
+            if (k && k === closedKey) return; // closed in the page already; the notebook has not caught up yet
+            closedKey = null;
+            const open = Boolean(k);
+            const wasOpen = drawer.classList.contains("open");
+            drawer.classList.toggle("open", open);
+            requestAnimationFrame(sizeCurve);
+            requestAnimationFrame(() => refit());
+          },
+        });
+        window.addEventListener("pagehide", stopKey, { once: true });
+      }
+
+      // collapsible controls rail; charts sized to their container re-measure on resize
+      function setRail(hidden, remember = true) {
+        document.body.classList.toggle("rail-hidden", hidden);
+        if (remember) {
+          autoHidden = false; // a manual choice wins over the drill-down's automatic tuck-away
+          try { localStorage.setItem("datacubes.railHidden", hidden ? "1" : "0"); } catch {}
+        }
+        requestAnimationFrame(() => refit());
+      }
+      document.getElementById("rail-toggle").addEventListener("click", () => setRail(!document.body.classList.contains("rail-hidden")));
+      document.getElementById("rail-hide").addEventListener("click", () => setRail(true));
+      try { if (localStorage.getItem("datacubes.railHidden") === "1") setRail(true); } catch {}
+
+      // About dialog
+      const dialog = document.getElementById("about");
+      document.getElementById("about-open").addEventListener("click", () => dialog.showModal());
+      document.getElementById("about-close").addEventListener("click", () => dialog.close());
+
+      // Scale the drill-down's fixed-size chart to fill its panel
+      let lastScale = 1;
+      function refit() {
+        if (!drawer.classList.contains("open")) return;
+        const pad = 20;
+        // offset sizes are layout sizes, unaffected by the transform, so measuring never feeds back into itself
+        const w = fit.offsetWidth ? Math.max(fit.scrollWidth, fit.offsetWidth) : 0, h = fit.offsetHeight;
+        const aw = frame.clientWidth - pad, ah = frame.clientHeight - pad;
+        if (!w || !h || aw <= 0 || ah <= 0) return;
+        // fill the panel: shrink on small screens, grow (up to 1.35x) when there is room, so no dead space
+        const s = Math.min(1, aw / w, ah / h);
+        if (Math.abs(s - lastScale) < 0.01) return;
+        lastScale = s;
+        fit.style.transform = Math.abs(s - 1) > 0.01 ? `scale(${s})` : "";
+      }
+      fit.style.width = "max-content";
+      new ResizeObserver(() => refit()).observe(frame);
+      new ResizeObserver(() => refit()).observe(fit); // late-rendering charts change the content size
+
+      // Deep queries: marimo renders outputs inside shadow roots
+      function deepAll(root, sel, out = []) {
+        if (!root) return out;
+        root.querySelectorAll(sel).forEach((n) => out.push(n));
+        root.querySelectorAll("*").forEach((n) => { if (n.shadowRoot) deepAll(n.shadowRoot, sel, out); });
+        return out;
+      }
+
+      // The curve is drawn with height "container": size its Vega embed to the panel, so opening or closing a
+      // drill-down only resizes the chart in the browser (no kernel round trip)
+      const curvePanel = document.querySelector(".curve");
+      let lastCurveH = 0;
+      function sizeCurve() {
+        const head = document.getElementById("curve-head");
+        const h = Math.max(140, curvePanel.clientHeight - 14 - (head ? head.offsetHeight : 0));
+        const embeds = deepAll(curvePanel, ".vega-embed");
+        let changed = h !== lastCurveH;
+        for (const e of embeds) {
+          if (e.style.height !== `${h}px`) { e.style.height = `${h}px`; e.style.display = "block"; changed = true; }
+        }
+        lastCurveH = h;
+        if (changed && embeds.length) window.dispatchEvent(new Event("resize"));
+      }
+      new ResizeObserver(() => sizeCurve()).observe(curvePanel);
+      new MutationObserver(() => requestAnimationFrame(sizeCurve)).observe(curvePanel, { childList: true, subtree: true });
+      // a new chart arrives inside marimo's shadow roots, which the observers above cannot see: check for it now and
+      // then (cheap; a resize is sent only when a box actually changes)
+      setTimeout(sizeCurve, 300);
+      setInterval(sizeCurve, 400);
+
+      // Open the drill-down the moment its content arrives (about half a second after a click), rather than when
+      // the drill_key value comes back: Studio delivers values through a long poll that takes ~2 s a round, so
+      // waiting for it held the drawer shut for 4 s. The placeholder text means nothing is picked: closed.
+      const drillCell = document.querySelector('#drill-fit marimo-cell');
+      let lastSig = null, closedSig = null;
+      const isDrill = (s) => s.trim() && !s.includes("Click a best-effort point") && !s.includes("That point summarises");
+      setInterval(() => {
+        if (!drillCell) return;
+        const text = (drillCell.shadowRoot ? drillCell.shadowRoot.textContent : drillCell.textContent).slice(0, 200);
+        // the point marker is part of the signature: neighbouring dots set by the same longer effort show the same
+        // text, and the page must still notice the new dot (or the arrows step from the old one again and again)
+        const pk = drillCell.shadowRoot ? drillCell.shadowRoot.querySelector("[data-pick]") : drillCell.querySelector("[data-pick]");
+        const mark = pk ? pk.getAttribute("data-pick") : "";
+        const sig = text + "|" + mark;
+        if (sig === lastSig) return;
+        lastSig = sig;
+        // the chart's ring follows the point this drill-down shows
+        const pv = isDrill(text) && pk ? mark : "-1";
+        const pin = document.getElementById("pick-key");
+        if (pin.value !== pv) { pin.value = pv; pin.dispatchEvent(new Event("input")); }
+        const open = isDrill(text) && sig !== closedSig;
+        if (open !== drawer.classList.contains("open")) {
+          drawer.classList.toggle("open", open);
+          requestAnimationFrame(sizeCurve);
+          requestAnimationFrame(() => refit());
+        }
+      }, 50);
+
+      // Close: hide the drill-down the moment the button is pressed, and clear the ring (a double-click clears
+      // the chart's click selection); the notebook's Close handler runs as well
+      drawer.addEventListener("click", (e) => {
+        const b = e.composedPath().find((n) => n.tagName === "BUTTON");
+        if (!b || b.textContent.trim() !== "Close") return;
+        closedKey = keyHost.marimoValue || null;
+        closedSig = lastSig; // this drill-down stays closed until another one arrives
+        drawer.classList.remove("open");
+        requestAnimationFrame(sizeCurve);
+        const cv = deepAll(curvePanel, "canvas, svg.marks")[0];
+        if (cv) {
+          const r = cv.getBoundingClientRect();
+          cv.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, composed: true, clientX: r.left + 5, clientY: r.top + 5 }));
+        }
+      }, true);
+
+      // Tell the notebook how big the chart area is, so it draws the charts to fit exactly (no scaling, no dead space)
+      const main = document.querySelector(".main");
+      const vpHost = document.getElementById("viewport-host");
+      let lastVp = "", vpTimer = 0;
+      function vpInput(host = vpHost) {
+        const roots = [host, host && host.shadowRoot].filter(Boolean);
+        for (const r of roots) {
+          const el = r.querySelector("input");
+          if (el) return el;
+          for (const n of r.querySelectorAll("*")) { const i = n.shadowRoot?.querySelector("input"); if (i) return i; }
+        }
+        return null;
+      }
+      function reportViewport() {
+        const w = Math.round(main.clientWidth - 28), h = Math.round(main.clientHeight - 8);
+        if (w < 200 || h < 200) return;
+        const v = `${w}x${h}`;
+        if (v === lastVp) return;
+        const el = vpInput();
+        if (!el) { setTimeout(reportViewport, 400); return; } // the control has not rendered yet
+        lastVp = v;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, v);
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+      }
+      new ResizeObserver(() => { clearTimeout(vpTimer); vpTimer = setTimeout(reportViewport, 250); }).observe(main);
+      reportViewport();
+
+      // ---- frames: the chart moves between frames in the browser, from the notebook's frames table ----
+      const railHost = document.querySelector('marimo-output[value="controls_panel"]');
+      const deepFind = (root, sel, out = []) => {
+        root.querySelectorAll(sel).forEach((e) => out.push(e));
+        root.querySelectorAll("*").forEach((e) => e.shadowRoot && deepFind(e.shadowRoot, sel, out));
+        return out;
+      };
+      const liveInput = document.getElementById("live-win");
+      const liveBar = document.getElementById("live-bar");
+      const playBtn = document.getElementById("live-play");
+      const playIcon = document.getElementById("live-play-icon");
+      const playLabel = document.getElementById("live-play-label");
+      const liveSpeed = document.getElementById("live-speed");
+      let live = null;
+      let timer = null;
+      const scrub = document.getElementById("live-scrub");
+      const nowEl = document.getElementById("live-now");
+      const frHost = document.getElementById("frame-report-host");
+      // the notebook hears the frame only when it settles (let go, paused, ended), never on every step
+      const reportFrame = () => {
+        if (!live || !live.live || !live.anim) return;
+        const el = vpInput(frHost);
+        if (!el) return;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, `${Math.round(Number(liveInput.value)) - live.lo}:${Date.now()}`);
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+      };
+      const setEnd = (e) => {
+        if (!live || !live.live) return;
+        const v = Math.max(live.lo, Math.min(live.hi, e));
+        liveInput.value = String(v);
+        liveInput.dispatchEvent(new Event("input"));
+        if (scrub.value !== String(v)) scrub.value = String(v);
+        const label = live.labels ? live.labels[Math.round(v) - live.lo] : "";
+        if (nowEl.textContent !== label) nowEl.textContent = label;
+      };
+      // a paused or let-go frame settles on the nearest real frame, which is what the notebook hears
+      const settle = () => { if (live && live.live) setEnd(Math.round(Number(liveInput.value))); };
+      const stopPlay = (report = true) => {
+        const was = Boolean(timer);
+        if (timer) cancelAnimationFrame(timer);
+        timer = null;
+        if (was) settle();
+        playIcon.setAttribute("icon", "lucide:play");
+        playLabel.textContent = "Play";
+        if (was && report) reportFrame();
+      };
+      const startPlay = () => {
+        if (!live || !live.live) return;
+        let e = Number(liveInput.value || live.end);
+        if (e >= live.hi) e = live.lo; // from the start again
+        setEnd(e);
+        playIcon.setAttribute("icon", "lucide:pause");
+        playLabel.textContent = "Pause";
+        // glide: the frame moves a little on every repaint, one frame per "speed" milliseconds
+        let last = performance.now(), pos = e;
+        const tick = (now) => {
+          pos += (now - last) / Number(liveSpeed.value) * live.step;
+          last = now;
+          if (pos >= live.hi) { setEnd(live.hi); stopPlay(); return; }
+          setEnd(pos);
+          timer = requestAnimationFrame(tick);
+        };
+        timer = requestAnimationFrame(tick);
+      };
+      scrub.addEventListener("input", () => { stopPlay(false); setEnd(Number(scrub.value)); });
+      scrub.addEventListener("change", () => { settle(); reportFrame(); });
+      playBtn.addEventListener("click", () => (timer ? stopPlay() : startPlay()));
+      // a new speed applies on the next repaint: the glide reads it every frame
+      const liveHost = document.getElementById("live-data");
+      if (liveHost) {
+        const stopLive = observeMarimoValue(liveHost, {
+          onValue: (v) => {
+            live = v;
+            const on = Boolean(v && v.live);
+            liveBar.hidden = !(on && v.anim);
+            stopPlay(false);
+            // the chart reads its frame from this input even with a single frame: reset it for every view, or a
+            // single-frame chart filters on the previous view's frame and draws nothing
+            if (v && v.end !== undefined && liveInput.value !== String(v.end)) {
+              liveInput.value = String(v.end);
+              liveInput.dispatchEvent(new Event("input"));
+            }
+            if (on) {
+              scrub.min = String(v.lo); scrub.max = String(v.hi); scrub.step = "any";
+              document.getElementById("live-title").textContent = v.title || "";
+              document.getElementById("live-first").textContent = (v.ends || [])[0] || "";
+              document.getElementById("live-last").textContent = (v.ends || [])[1] || "";
+              setEnd(v.end);
+            }
+          },
+        });
+        window.addEventListener("pagehide", stopLive, { once: true });
+      }
+
+      // A stretch dragged on the drill-down's streams goes to the notebook to be measured and comes back as a point
+      // for the main chart (#brush-dot). It comes back through a cell (rendered as soon as it runs), not a bound output, which
+      // Studio refreshes only every couple of seconds
+      const bsIn = document.getElementById("bs"), bdotIn = document.getElementById("brush-dot");
+      const brHost = document.getElementById("brush-report-host"), bdHost = document.getElementById("brush-dot-host");
+      const sendText = (host, v) => {
+        const el = vpInput(host);
+        if (!el) return;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, v + ":" + Date.now());
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+      };
+      // The drag on the streams, run here: one window for every panel (#brush-win, read by the drill chart), in
+      // elapsed minutes. A press inside the window moves it; elsewhere it starts a new one; a click outside clears
+      // it; a press on either edge drags just that edge. Where the press landed in time comes from the chart (#bs, set on pointerdown over a stream panel); the
+      // rest is how far the pointer moves, in the panel's minutes per pixel. On release the window goes to the
+      // notebook, which measures it and sends back its point for the main chart.
+      const winIn = document.getElementById("brush-win");
+      let brushSent = "", drag = null, bsAt = 0;
+      const getWin = () => { const p = winIn.value.split(",").map(Number); return p.length === 2 && p.every(isFinite) ? p : null; };
+      const setWin = (w) => { const v = w ? w[0].toFixed(3) + "," + w[1].toFixed(3) : ""; if (winIn.value !== v) { winIn.value = v; winIn.dispatchEvent(new Event("input")); } };
+      let inflight = 0, queued = null, lastSend = 0;
+      const sendWin = (v, live) => {
+        if (v === brushSent) return;
+        const now = performance.now();
+        if (inflight && now - inflight < 1500) { queued = v; return; }
+        if (live && now - lastSend < 100) { queued = v; return; }
+        brushSent = v; inflight = now; lastSend = now; queued = null;
+        sendText(brHost, v);
+      };
+      const clearBrush = () => {
+        queued = null; inflight = 0;
+        setWin(null);
+        if (brushSent) { brushSent = ""; sendText(brHost, "clear"); }
+        cancelAnimationFrame(glide); shown = null;
+        if (bdotIn.value) { bdotIn.value = ""; bdotIn.dispatchEvent(new Event("input")); }
+      };
+      const drillScale = () => {
+        const el = deepAll(drawer, "[data-mpp]")[0];
+        return el ? { mpp: parseFloat(el.getAttribute("data-mpp")), tmax: parseFloat(el.getAttribute("data-tmax")) } : null;
+      };
+      bsIn.addEventListener("input", () => { bsAt = performance.now(); });
+      // which part of the window a time is on: an edge (within 7 px), inside, or outside
+      const zone = (m, w, sc) => {
+        if (!w || !isFinite(m)) return "new";
+        const tol = 7 / (lastScale || 1) * sc.mpp;
+        if (Math.abs(m - w[0]) <= tol) return "left";
+        if (Math.abs(m - w[1]) <= tol) return "right";
+        return m > w[0] && m < w[1] ? "move" : "new";
+      };
+      const CURSOR = { left: "ew-resize", right: "ew-resize", move: "grab", new: "" };
+      const setCursor = (c) => deepAll(drawer, "canvas").forEach((el) => { if (el.style.cursor !== c) el.style.cursor = c; });
+      const hmIn = document.getElementById("hm");
+      hmIn.addEventListener("input", () => {
+        if (drag) return;
+        const sc = drillScale();
+        setCursor(sc ? CURSOR[zone(parseFloat(hmIn.value), getWin(), sc)] : "");
+      });
+      drawer.addEventListener("pointerdown", (e) => { if (e.button === 0) drag = { x0: e.clientX, at: performance.now(), m0: null, mode: null, moved: false }; }, true);
+      window.addEventListener("pointermove", (e) => {
+        if (!drag || !(e.buttons & 1)) return;
+        const sc = drillScale();
+        if (!sc || !isFinite(sc.mpp)) return;
+        if (drag.m0 === null) {
+          if (bsAt < drag.at - 20) return;  // not on a stream panel (or the chart has not said where yet)
+          drag.m0 = parseFloat(bsIn.value);
+          drag.w0 = getWin();
+          drag.mode = zone(drag.m0, drag.w0, sc);
+          setCursor(drag.mode === "move" ? "grabbing" : CURSOR[drag.mode]);
+        }
+        if (!isFinite(drag.m0)) return;
+        const dm = (e.clientX - drag.x0) / (lastScale || 1) * sc.mpp;
+        if (Math.abs(e.clientX - drag.x0) > 3) drag.moved = true;
+        if (!drag.moved) return;
+        const minLen = 5 / 60;  // the shortest window the notebook measures
+        if (drag.mode === "move") {
+          const len = drag.w0[1] - drag.w0[0];
+          const a = Math.max(0, Math.min(sc.tmax - len, drag.w0[0] + dm));
+          setWin([a, a + len]);
+        } else if (drag.mode === "left") {
+          setWin([Math.max(0, Math.min(drag.w0[1] - minLen, drag.w0[0] + dm)), drag.w0[1]]);
+        } else if (drag.mode === "right") {
+          setWin([drag.w0[0], Math.min(sc.tmax, Math.max(drag.w0[0] + minLen, drag.w0[1] + dm))]);
+        } else {
+          const m1 = Math.max(0, Math.min(sc.tmax, drag.m0 + dm));
+          setWin([Math.min(drag.m0, m1), Math.max(drag.m0, m1)]);
+        }
+        // the point follows the window while it moves: measured as it goes (one request at a time)
+        const w = getWin();
+        if (w && (w[1] - w[0]) * 60 >= 5) sendWin(w[0] + "," + w[1], true);
+      });
+      window.addEventListener("pointerup", () => {
+        const d = drag;
+        drag = null;
+        if (!d) return;
+        if (d.mode === "move") setCursor("grab");
+        setTimeout(() => {
+          if (!d.moved) {  // a click: outside the window it clears; on the map or elsewhere it does nothing
+            const w = getWin(), m = parseFloat(bsIn.value);
+            if (bsAt >= d.at - 20 && !(w && m >= w[0] && m <= w[1])) clearBrush();
+            return;
+          }
+          const w = getWin();
+          if (!w || (w[1] - w[0]) * 60 < 5) { clearBrush(); return; }
+          sendWin(w[0] + "," + w[1], false);
+        }, 30);
+      });
+      // a new drill-down starts without a window
+      let lastDrillMark = null;
+      setInterval(() => {
+        const m = deepAll(drawer, "[data-pick]")[0];
+        const k = m ? m.getAttribute("data-pick") : "";
+        if (k !== lastDrillMark) { lastDrillMark = k; if (getWin()) { setWin(null); brushSent = ""; } }
+      }, 120);
+      // a new point glides from the last one (about 0.2 s; along the log scale on duration and distance axes)
+      const parseDot = (v) => { const p = (v || "").split("|"); return p.length >= 3 && isFinite(+p[0]) && isFinite(+p[1]) ? { x: +p[0], y: +p[1], label: p[2], log: p[3] === "log" } : null; };
+      const putDot = (v) => { if (bdotIn.value !== v) { bdotIn.value = v; bdotIn.dispatchEvent(new Event("input")); } };
+      let shown = null, glide = 0;
+      const showDot = (v) => {
+        cancelAnimationFrame(glide);
+        const to = parseDot(v);
+        if (!to || !shown) { shown = to; putDot(v); return; }
+        const from = shown, t0 = performance.now(), T = 220;
+        const lx = to.log && from.x > 0 && to.x > 0;
+        const step = (now) => {
+          const k = Math.min(1, (now - t0) / T), e = 1 - Math.pow(1 - k, 3);
+          const x = lx ? Math.exp(Math.log(from.x) + (Math.log(to.x) - Math.log(from.x)) * e) : from.x + (to.x - from.x) * e;
+          const y = from.y + (to.y - from.y) * e;
+          shown = { ...to, x, y };
+          putDot(k < 1 ? x + "|" + y + "|" + to.label + "|" + (to.log ? "log" : "lin") : v);
+          if (k < 1) glide = requestAnimationFrame(step); else shown = to;
+        };
+        glide = requestAnimationFrame(step);
+      };
+      let lastBd = null;
+      setInterval(() => {
+        const n = deepAll(bdHost, "[data-bdot]")[0];
+        const v = n ? n.getAttribute("data-bdot") : "";
+        if (v === lastBd) return;
+        lastBd = v;
+        inflight = 0;  // the notebook answered: send the latest window, if one is waiting
+        if (queued) { const q = queued; queued = null; sendWin(q, false); }
+        if (!getWin()) { cancelAnimationFrame(glide); shown = null; putDot(""); return; }
+        showDot(v);
+      }, 30);
+
+      // Left and right arrows: the previous or next activity along the Best line (the notebook works out which); up
+      // and down: a frame forward or back when there are frames. Not while a control has the keyboard.
+      const keyHostEl = document.getElementById("key-report-host");
+      let keyPending = null; // the point on screen when the last arrow was sent, until a new one shows
+      document.addEventListener("keydown", (e) => {
+        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+        if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+        const path = e.composedPath();
+        const busy = path.some((n) => n.nodeType === 1 && (/^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(n.tagName) || n.isContentEditable
+          || ["slider", "combobox", "listbox", "menu", "option", "radio", "textbox"].includes(n.getAttribute && n.getAttribute("role"))));
+        if (busy) return;
+        const vert = e.key === "ArrowUp" || e.key === "ArrowDown";
+        if (vert && !(live && live.live)) return;  // no frames: leave the page to scroll
+        e.preventDefault();
+        const d = e.key === "ArrowRight" || e.key === "ArrowUp" ? 1 : -1;
+        if (vert) {
+          stopPlay(false);
+          setEnd(Math.round(Number(liveInput.value)) + d);
+          reportFrame();
+          return;
+        }
+        // one step at a time, from the point on screen: a press while the last one is still on its way is dropped,
+        // so holding the key or pressing quickly never jumps past an activity that was not shown
+        const shown = document.getElementById("pick-key").value;
+        if (keyPending && keyPending.shown === shown && keyPending.d === d && performance.now() - keyPending.at < 3000) return;
+        keyPending = { shown, d, at: performance.now() };
+        const el = vpInput(keyHostEl);
+        if (!el) return;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, (d > 0 ? "next" : "prev") + ":" + shown + ":" + Date.now());
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+      });
+
+      document.querySelector("#app-shell")?.setAttribute("data-ready", "");
+    </script>
+  </body>
+</html>
