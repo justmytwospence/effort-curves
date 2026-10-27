@@ -632,6 +632,25 @@
         const label = live.labels ? live.labels[Math.round(v) - live.lo] : "";
         if (nowEl.textContent !== label) nowEl.textContent = label;
       };
+      let stepAnim = 0, stepTarget = null;
+      const cancelStep = () => { cancelAnimationFrame(stepAnim); stepAnim = 0; stepTarget = null; };
+      const stepTo = (d) => {
+        if (!live || !live.live) return;
+        const from = Number(liveInput.value);
+        const to = Math.max(live.lo, Math.min(live.hi, (stepTarget ?? Math.round(from)) + d));
+        if (to === (stepTarget ?? from)) return;  // already there (or heading there): at an end
+        cancelAnimationFrame(stepAnim);
+        stepTarget = to;
+        const t0 = performance.now(), T = 260;
+        const tick = (now) => {
+          const k = Math.min(1, (now - t0) / T), e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+          setEnd(from + (to - from) * e);
+          if (k < 1) { stepAnim = requestAnimationFrame(tick); return; }
+          stepAnim = 0; stepTarget = null;
+          reportFrame();
+        };
+        stepAnim = requestAnimationFrame(tick);
+      };
       // a paused or let-go frame settles on the nearest real frame, which is what the notebook hears
       const settle = () => { if (live && live.live) setEnd(Math.round(Number(liveInput.value))); };
       const stopPlay = (report = true) => {
@@ -661,9 +680,9 @@
         };
         timer = requestAnimationFrame(tick);
       };
-      scrub.addEventListener("input", () => { stopPlay(false); setEnd(Number(scrub.value)); });
+      scrub.addEventListener("input", () => { cancelStep(); stopPlay(false); setEnd(Number(scrub.value)); });
       scrub.addEventListener("change", () => { settle(); reportFrame(); });
-      playBtn.addEventListener("click", () => (timer ? stopPlay() : startPlay()));
+      playBtn.addEventListener("click", () => { cancelStep(); return timer ? stopPlay() : startPlay(); });
       // a new speed applies on the next repaint: the glide reads it every frame
       const liveHost = document.getElementById("live-data");
       if (liveHost) {
@@ -672,6 +691,7 @@
             live = v;
             const on = Boolean(v && v.live);
             liveBar.hidden = !(on && v.anim);
+            cancelStep();
             stopPlay(false);
             // the chart reads its frame from this input even with a single frame: reset it for every view, or a
             // single-frame chart filters on the previous view's frame and draws nothing
@@ -856,8 +876,7 @@
         const d = e.key === "ArrowRight" || e.key === "ArrowUp" ? 1 : -1;
         if (vert) {
           stopPlay(false);
-          setEnd(Math.round(Number(liveInput.value)) + d);
-          reportFrame();
+          stepTo(d);
           return;
         }
         // one step at a time, from the point on screen: a press while the last one is still on its way is dropped,

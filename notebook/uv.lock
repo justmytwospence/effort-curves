@@ -229,10 +229,10 @@ wheels = [
 
 [[package]]
 name = "effort-curves"
-version = "0.3.0"
-source = { url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.3.0/effort_curves-0.3.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.6.0/effort_curves-0.6.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.3.0/effort_curves-0.3.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f56205d0cc142573c538c714c88d3626d8007a9beb9dd4ad60594d9dbd6c3b59" },
+    { url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.6.0/effort_curves-0.6.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1126da9768fcca7c6ccb155975b71da33d6744c9392c3c055644b25ef2e56d54" },
 ]
 
 [[package]]
@@ -630,7 +630,7 @@ dependencies = [
 requires-dist = [
     { name = "altair", specifier = ">=6.3.0" },
     { name = "duckdb", specifier = ">=2.0.0" },
-    { name = "effort-curves", url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.3.0/effort_curves-0.3.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { name = "effort-curves", url = "https://github.com/justmytwospence/effort-curves/releases/download/v0.6.0/effort_curves-0.6.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "marimo-studio", specifier = "==0.4.1" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "polars", specifier = ">=2.0.0" },

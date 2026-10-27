@@ -6,9 +6,18 @@ supplied by this starter.
 
 ## Project intent
 
-Audience: Spencer, exploring his own Garmin training data. Goal: generalized best-effort (mean-max) curves from the notebook's activity cube, with the full spread of activities by default and click-through to where a best effort happened.
+Audience: Spencer, exploring his own Garmin training data. Goal: exact best-effort (mean-max) curves from the effort-curves engine, with the full spread of activities, the efforts that make up the Best, and click-through to where an effort happened.
 
-Design (approved direction, Oct 2026): a clean, professional full-screen web app. Everything fits one screen with no page scroll. No stat cards. Slim dark top bar (live title, date window, activity count from notebook value `headline`; an About button opens a dialog with `ABOUT_MD`, `rebuild`, `excluded_view`). Left rail (290 px) with the compact controls (`controls_panel`; scrolls only inside the rail if a screen is very short). Right column: the curve (`chart_view`; a click stores the point in notebook state `get_pick`) fills the height until a point is picked; then the notebook re-renders it shorter (`DASH['curve_h_open']`) and the drill-down (`drill` cell, shown while notebook value `drill_key` is non-empty) appears below it. Its Close button is the notebook's `drill_close`. The controls rail collapses with the top-bar toggle or its Hide button (remembered in localStorage); it never collapses on its own. The page reports its chart-area size into the notebook's hidden `viewport` text control; `dash_layout` sizes the curve (full height, or half while a drill-down is open) and the drill-down (map square = half height) from it, so nothing is scaled. Flat full-window layout: no rounded cards, 1 px dividers. Controls are labelled rows from the notebook (`CONTROL_ROWS`), so labels sit in one column and sliders align. Chart sizes come from the notebook's `DASH` dict (sized for ~1650 x 950 px); the drill-down's single linked Vega view cannot size to its container, so the page scales it down to fit its panel. Inter throughout, white panels with thin borders on a light grey ground, accent #1f4e9c, window highlight #f97316. All numbers come from notebook values; keep analytical text in the notebook.
+Design: a clean, professional full-screen web app; everything fits one screen with no page scroll. Slim dark top bar (title, date window and activity count from `headline`; About opens `ABOUT_MD`, `rebuild`, `excluded_view`). Left rail (290 px, collapsible, remembered in localStorage) holds `controls_panel`, which is the same for every chart. The chart area has a row of chart-specific controls (`chart_controls`: Window, Each line is the / Percentile, Percentiles, Heart-rate data, Step, Dots) with the animation's Play bar and scrubber at its right end; below it the chart (`chart_view`, built by `client_chart`) and, when an effort is picked, the drill-down drawer (`drill`, open while `drill_key` is non-empty; Close is `drill_close`). Flat full-window layout, 1 px dividers, Inter, accent #1f4e9c, highlight #f97316. All numbers come from notebook values; analytical text stays in the notebook.
+
+How the chart reads (keep these concepts when changing it):
+- The Best is drawn as efforts: one stretch of one activity holding the Best over a range of x, as a translucent bar with its hardest window as a dot; handoffs are exact (`EFFORTS`, `EFFORT_LINE`, `EFFORT_BARS`, `EFFORT_CAPS` from the `efforts` cell). Ribbons, median and percentiles stay on the grid.
+- Dimensions with a harder direction are cumulative (`BAND_KIND` in `curve`): time and distance into (at least x in), heart rate for pace/GAP/power/climbing (at most h). Their bands nest, and as x axes they are exact staircases (engine `frontier_into`); a smaller-is-harder axis is stored mirrored (u = -x) and flipped back for drawing.
+- The Dots menu (`dot_cloud`, `cloud`) judges each activity's own efforts: Best per activity (dots), Records as set and Near the best (segments).
+- Frames animate by blending neighbouring frames in the browser (the page owns the scrubber and Play; `frame_report` tells the notebook where it settled); efforts and cloud items are matched across frames by identity and glide or fade. Up/Down step frames, Left/Right step efforts (`key_nav`).
+- Dragging a stretch on the drill-down's streams puts a diamond on the main chart (`brush_report`, `brush_dot`).
+
+Agent workflow and session rules: `~/Projects/effort-curves/AGENTS.md` on the NUC.
 
 ## Use the supplied Studio integration
 
@@ -159,5 +168,6 @@ Studio keeps its own build state and lock files out of Git. Check
 `git status --short --ignored` after running new tooling and update the view's
 ignore rules before committing.
 
+## Agent sessions
 
-The curve chart has height "container": the page's `sizeCurve` sets its Vega embed height to the panel, so a drill-down opening or closing only resizes it in the browser. Its orange ring comes from the chart's own click selection. Close hides the drill-down instantly in the page (and double-clicks the chart to clear the ring) before the notebook's Close handler clears the pick.
+Never stop an app session (open tabs show "App stopped" until the user clicks Restart). Saving a version drains the old app sessions by itself; stop only your own edit session and tell the user to reload. Full guidance: `~/Projects/effort-curves/AGENTS.md` on the NUC.

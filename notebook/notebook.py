@@ -76,7 +76,7 @@ def about():
 
     **Stored curves.** For each activity the best power, speed, gradient, heart rate, vertical speed and grade-adjusted pace are kept for every duration from 1 s to 100 s and in 1 % steps beyond (to 15 h), and for every distance from 100 m in 1 % steps (to 200 km). A best held for longer counts at every shorter length too, so each curve only falls as the windows lengthen, and between two 1 % steps it cannot move by more than 1 %. New activities are computed on their own (well under a second each) and added; the stored curves feed the unfiltered duration and distance views directly.
 
-    **Filters, bands and value axes are exact.** Any narrowed slider, a band split or a value on the x axis (gradient, pace, power, heart rate) runs a scan of every window of the selected activities, with each window's own average tested against the exact bounds. A slider left at its end means no limit on that side. Value axes are drawn in bins (1 % gradient, 0.2 m/s, 20 W, 5 bpm).
+    **Filters, bands and value axes are exact.** Any narrowed slider, a band split or a value on the x axis (gradient, pace, power, heart rate) runs a scan of every window of the selected activities, with each window's own average tested against the exact bounds. A slider left at its end means no limit on that side. Value axes are drawn in bins (1 % gradient, 0.2 m/s, 20 W, 5 bpm). Bands of time or distance into an activity are cumulative (later is harder): a line holds every window starting at least that far in, so the lines nest, and the gap between them is the fade.
 
     The numbers check out: per-activity best power matches the previous cube (which itself matched Garmin's mean-max power to a median of 0.15 %) to within 1 % for 97 % of activities and lengths; the differences come from smart-recording activities the old cube could not measure and GPS glitches it let through.
 
@@ -106,7 +106,7 @@ def cube_defs():
     # bin widths of the value axes and slider steps: time-into 5 min, distance-into 0.5 mi, gradient 1 %, speed 0.2 m/s, power 20 W, heart rate 5 bpm
     BINS = {"tb": 300, "db": 804.672, "gb": 0.01, "vb": 0.2, "pb": 20, "hb": 5, "cb": 5, "sb": 0.05}
     CUBE_DIR = "cube"
-    CUBE_SCHEMA = 11  # bump when the curves' columns or the engine's rules change: every sport rebuilds once
+    CUBE_SCHEMA = 12  # bump when the curves' columns or the engine's rules change: every sport rebuilds once
 
 
     def cube_files(sport):
@@ -285,7 +285,8 @@ def cube_defs():
         """Each activity's best of every metric at every stored length, by time and by distance: one row per activity and length."""
         _out = []
         for _basis, _grid in (("time", TIME_GRID), ("dist", DIST_GRID)):
-            _y, _t = P.compute(_basis, _grid, 0.01)
+            # every start (exhaustive): the frontier's efforts and handoffs are measured against these values
+            _y, _t = P.compute(_basis, _grid, 0.0)
             _a, _k, _m = _y.shape
             _cols = {"activity_id": np.repeat(P.activity_ids, _k), "basis": [_basis] * (_a * _k), "len": np.tile(_grid.astype(np.int32), _a)}
             for _name in STORED_METRICS:
@@ -877,9 +878,9 @@ def y_axis(METRICS, get_y, set_y, sport):
 
 @app.cell(hide_code=True)
 def x_axis(DIMS, get_x, set_x):
-    _x = get_x() if get_x() in DIMS and get_x() not in ("tb", "db", "sb") else "len_time"
+    _x = get_x() if get_x() in DIMS and get_x() not in ("sb",) else "len_time"
     x_axis = mo.ui.dropdown(
-        options={v: k for k, v in DIMS.items() if k not in ("tb", "db", "sb")},
+        options={v: k for k, v in DIMS.items() if k not in ("sb",)},
         value=DIMS[_x],
         label="", full_width=True,
         on_change=set_x,
@@ -1086,6 +1087,9 @@ def preset(
         "Run · Pace curve through the years": dict(sport="Run", y="v", x="len_time", lines="none", animate="window", step="Month"),
         "Run · Pace curve vs a year earlier": dict(sport="Run", y="v", x="len_time", lines="lastyear"),
         "Run · Durability: pace by time into the run": dict(sport="Run", y="v", x="len_time", lines="tb", filters={"tb": [0, 240]}),
+        "Run · Durability: best 10 min by time into the run": dict(sport="Run", y="v", x="tb", length="10 min", lines="none", filters={"tb": [0, 240]}),
+        "Run · Durability: best mile by distance into the run": dict(sport="Run", y="v", x="db", length="1 mi", lines="none"),
+        "Run · Efficiency: best 10 min pace by heart rate": dict(sport="Run", y="v", x="hb", length="10 min", lines="none", filters={"gb": [-2, 2]}),
         "Run · Pace curve by time into the run": dict(sport="Run", y="v", x="len_time", lines="none", animate="tb", filters={"tb": [0, 240]}),
         "Run · Pace by gradient, year by year": dict(sport="Run", y="v", x="gb", length="5 min", lines="none", animate="year", period="all"),
         "Run · Pace by gradient": dict(sport="Run", y="v", x="gb", length="5 min", lines="none"),
@@ -1320,7 +1324,7 @@ def dot_cloud_cell():
     # The dot cloud under the curve (in the row above the chart): None, or one of three principled subsets of the efforts
     # behind it
     dot_cloud = mo.ui.dropdown(
-        {"None": "none", "Strongest length": "strong", "Records as set": "records", "Near the best": "near"},
+        {"None": "none", "Best per activity": "strong", "Records as set": "records", "Near the best": "near"},
         value="None",
     )
     return (dot_cloud,)
@@ -1504,6 +1508,23 @@ def curve(
     }
 
 
+    # Bands of a dimension with a harder direction are cumulative: time and distance into an activity (later is harder),
+    # so a band holds every window starting at least that far in, and its lines nest like the curve's own lengths (each
+    # a frontier, held at least that far in). Other dimensions' bands are disjoint ranges.
+    # Heart rate has one too for outputs that are better when higher at the same effort (pace, grade-adjusted pace,
+    # power, climbing rate): a lower heart rate is harder, so its bands hold every window at most that heart rate.
+    BAND_KIND = {"tb": "at_least", "db": "at_least", **({"hb": "at_most"} if _ym in ("v", "x", "p", "a") else {})}
+
+
+    def _band_filter(k, lo, hi):
+        """The engine filter of a band of k (engine units): [lo, hi), or open on the easy side when cumulative."""
+        if BAND_KIND.get(k) == "at_least":
+            return (_ENGINE[k], lo, float("nan"))
+        if BAND_KIND.get(k) == "at_most":
+            return (_ENGINE[k], float("nan"), float(np.nextafter(hi, -np.inf)))
+        return (_ENGINE[k], lo, float(np.nextafter(hi, -np.inf)))
+
+
     def _band_edges(k, cap):
         """Bands across the dimension's filter range (itself the data's range unless narrowed), of the finest round
         width on the dimension's ladder that keeps them to `cap`: edges (display units) and names."""
@@ -1521,6 +1542,12 @@ def curve(
         # a dash between two numbers reads as a minus once either is negative, so those say "to", with a real minus sign
         _sep = lambda a, b: " to " if min(a, b) < 0 else "–"
         _num = lambda v: _unit(k, v).replace("-", "−")
+        if BAND_KIND.get(k) == "at_most":
+            return _e, ["Any heart rate" if (i == len(_e) - 2 and _e[-1] >= FILTER_FULL[k][1]) else f"≤ {_num(_e[i + 1])}{_UNITS[k]}"
+                        for i in range(len(_e) - 1)]
+        if BAND_KIND.get(k) == "at_least":
+            _all = {"tb": "Any time", "db": "Anywhere"}[k]
+            return _e, [_all if (i == 0 and _e[0] <= 0) else f"≥ {_num(_e[i])}{_UNITS[k]}" for i in range(len(_e) - 1)]
         return _e, [f"{_num(_e[i])}{_sep(_e[i], _e[i + 1])}{_num(_e[i + 1])}{_UNITS[k]}" for i in range(len(_e) - 1)]
 
 
@@ -1613,7 +1640,8 @@ def curve(
         _ae, _an = _band_edges(_A, max(3, 40 // _n) if (not _len_axis and _g in _ENGINE) else 15)
         _abands = [(_an[i], _range(_A, _ae[i], _ae[i + 1])) for i in range(len(_an))]
         # the scrubber's two ends: the range the bands cover, not the first and last band
-        FRAME_ENDS = [f"{_unit(_A, v).replace('-', chr(0x2212))}{_UNITS[_A]}" for v in (_ae[0], _ae[-1])]
+        FRAME_ENDS = ([_an[0], _an[-1]] if BAND_KIND.get(_A)
+                      else [f"{_unit(_A, v).replace('-', chr(0x2212))}{_UNITS[_A]}" for v in (_ae[0], _ae[-1])])
     else:
         FRAME_ENDS = None
     if AXES_CLASH or not _sel.height:
@@ -1650,7 +1678,8 @@ def curve(
         _roles = []
         if not _len_axis:
             _w = BINS[_x]
-            _lo_b, _hi_b = {"gb": (-60, 60), "vb": (0, int(np.ceil(SPEED_CAP[sport.value] / _w)) + 1), "pb": (0, 150), "hb": (6, 47), "cb": (0, int(CADENCE_CAP[sport.value] / _w) + 1)}[_x]
+            _lo_b, _hi_b = {"tb": (int(np.floor(filters.value["tb"][0] * 60 / _w)), int(np.ceil(filters.value["tb"][1] * 60 / _w))),
+                            "db": (int(np.floor(filters.value["db"][0] * 1609.344 / _w)), int(np.ceil(filters.value["db"][1] * 1609.344 / _w))), "gb": (-60, 60), "vb": (0, int(np.ceil(SPEED_CAP[sport.value] / _w)) + 1), "pb": (0, 150), "hb": (6, 47), "cb": (0, int(CADENCE_CAP[sport.value] / _w) + 1)}[_x]
             _roles.append(("x", _ENGINE[_x], (np.arange(_lo_b, _hi_b + 1) * _w).astype(np.float64)))
         if _lbands:
             _lcuts, _le = _cuts_of(_lbands)
@@ -1686,9 +1715,9 @@ def curve(
             for _ai, _ab in _aloop:
                 _f = list(_filters)
                 if _lb is not None:
-                    _f.append((_ENGINE[_g], _lb[0], np.nextafter(_lb[1], -np.inf)))
+                    _f.append(_band_filter(_g, _lb[0], _lb[1]))
                 if _ab is not None:
-                    _f.append((_ENGINE[_A], _ab[1][0], np.nextafter(_ab[1][1], -np.inf)))
+                    _f.append(_band_filter(_A, _ab[1][0], _ab[1][1]))
                 _kw = {}
                 if _grouped:
                     _kw["group"] = (_grouped[0][1], _grouped[0][2])
@@ -1696,6 +1725,17 @@ def curve(
                     _kw["group2"] = (_grouped[1][1], _grouped[1][2])
                 _y, _t0 = _P.compute(_basis, _lengths, 0.0, _f, activities=_ix, **_kw)
                 _y, _t0 = _y[..., _mi], _t0[..., _mi]
+                for _gi, _role in enumerate(_gnames):
+                    _bk = BAND_KIND.get({"lines": _g, "anim": _A}.get(_role))
+                    if _bk:
+                        # cumulative: each band takes the best of its neighbour on the easy side, running from the hard end
+                        _y, _t0 = np.moveaxis(_y, 1 + _gi, 0).copy(), np.moveaxis(_t0, 1 + _gi, 0).copy()
+                        _nbr = 1 if _bk == "at_least" else -1
+                        for _bi in (range(_y.shape[0] - 2, -1, -1) if _bk == "at_least" else range(1, _y.shape[0])):
+                            _take = (_y[_bi + _nbr] > _y[_bi]) | (np.isnan(_y[_bi]) & ~np.isnan(_y[_bi + _nbr]))
+                            _y[_bi] = np.where(_take, _y[_bi + _nbr], _y[_bi])
+                            _t0[_bi] = np.where(_take, _t0[_bi + _nbr], _t0[_bi])
+                        _y, _t0 = np.moveaxis(_y, 0, 1 + _gi), np.moveaxis(_t0, 0, 1 + _gi)
                 # walk the grouped axes: each combination of bins is one (line, frame) curve; x bins stay as the length axis
                 _combos = [((), _ln, _ai, None)]
                 for _role in _gnames:
@@ -1729,6 +1769,10 @@ def curve(
     if _g in _ENGINE and _per.height:
         _la = dict(_per.group_by("series").agg(pl.col("activity_id").n_unique()).iter_rows())
         _l0, _l1 = _thin_ends([_la.get(_nm, 0) for _nm in _names])
+        if BAND_KIND.get(_g) == "at_least":
+            _l0 = 0
+        elif BAND_KIND.get(_g) == "at_most":
+            _l1 = len(_names)
         if (_l0, _l1) != (0, len(_names)):
             _per = _per.filter(pl.col("series").is_in(_names[_l0:_l1]))
             _names, _edges = _names[_l0:_l1], _edges[_l0:_l1 + 1]
@@ -1739,11 +1783,13 @@ def curve(
     # (best of this length and every longer one), filtered or not. The display table already holds it; scans get it here.
     _T1 = time.time()
     _T2 = None
-    MONOTONE = _len_axis and SCAN
+    # a value axis with a harder direction (time into: later is harder) reads "at least x in", as its bands do
+    MONOTONE = bool(_len_axis or BAND_KIND.get(_x)) and SCAN
     _env = "max(y) over w" if MONOTONE else "y"
     _env_t = "arg_max(t_start, y) over w" if MONOTONE else "t_start"
     _env_src = "arg_max(src0, y) over w" if MONOTONE else "src0"
-    _env_window = "window w as (partition by series, fb, activity_id order by xb desc rows between unbounded preceding and current row)" if MONOTONE else ""
+    _env_window = (f"window w as (partition by series, fb, activity_id order by xb {'asc' if BAND_KIND.get(_x) == 'at_most' else 'desc'} rows between unbounded preceding and current row)"
+                   if MONOTONE else "")
 
     # Frames: what the animation steps through. Each frame is a set of activities (a window, a year) or a band; every
     # frame's Best (with its effort), percentiles and count per line and length are computed here at once, so moving
@@ -1756,7 +1802,7 @@ def curve(
     _n_series = max(1, len(SERIES_ORDER) if _g != "year" else int(_sel["series"].n_unique()))
     _n_x = len(DISPLAY_TIME if _basis == "time" else DISPLAY_DIST) if _len_axis else 120
     FRAME_NOTE = ""
-    _frame_tbl, _kept, _join = None, None, None
+    _frame_tbl, _kept, _join, _win = None, None, None, None
     _fast = (
         not SCAN and _g == "none" and _len_axis and abs(_L - POS_DAYS) <= 1 and not (HR_INVOLVED and hr_data.value != "any")
         and _A == "window" and anim_step.value == "Week" and (_hi_d - (_w1 - _epoch).days) % POS_STEP == 0
@@ -1776,6 +1822,7 @@ def curve(
         FRAME_DEFAULT = _fi.get((_w1 - _epoch).days, len(_ends) - 1)
         _frame_tbl = pl.DataFrame({"f": list(range(len(_ends))), "e": _ends})
         _join = f"join frame_df fr on p.d > fr.e - {POS_DAYS} and p.d <= fr.e"
+        _win = POS_DAYS
     else:
         con.register("per_act0_df", _per.to_arrow())
         con.execute(f"""
@@ -1795,6 +1842,7 @@ def curve(
             _frame_tbl = pl.DataFrame({"f": list(range(len(_ends))), "e": _ends})
             con.register("frame_df", _frame_tbl.to_arrow())
             _join = f"join frame_df fr on p.d > fr.e - {_L} and p.d <= fr.e"
+            _win = _L
             FRAME_LABELS = [f"{_epoch + dt.timedelta(days=e - _L + 1):%b %d, %Y} – {_epoch + dt.timedelta(days=e):%b %d, %Y}" for e in _ends]
             FRAME_DEFAULT = len(_ends) - 1
         elif _A == "year":
@@ -1839,6 +1887,10 @@ def curve(
         _keep = [i for i, a in enumerate(FRAME_ACTS) if a >= 3]
         if FRAME_KIND == "band":
             _f0, _f1 = _thin_ends(FRAME_ACTS)
+            if BAND_KIND.get(_A) == "at_least":
+                _f0 = 0
+            elif BAND_KIND.get(_A) == "at_most":
+                _f1 = len(FRAME_ACTS)
             _keep = [i for i in _keep if _f0 <= i < _f1]
         if 0 < len(_keep) < len(FRAME_LABELS):
             _new = {old: new for new, old in enumerate(_keep)}
@@ -1848,7 +1900,11 @@ def curve(
             FRAME_ACTS = [FRAME_ACTS[i] for i in _keep]
             FRAME_DEFAULT = _new[max([i for i in _keep if i <= FRAME_DEFAULT] or [_keep[0]])]
             if FRAME_KIND == "band":
-                FRAME_ENDS = [f"{_unit(_A, v).replace('-', chr(0x2212))}{_UNITS[_A]}" for v in (_ae[_keep[0]], _ae[_keep[-1] + 1])]
+                FRAME_ENDS = ([FRAME_LABELS[0], FRAME_LABELS[-1]] if BAND_KIND.get(_A)
+                              else [f"{_unit(_A, v).replace('-', chr(0x2212))}{_UNITS[_A]}" for v in (_ae[_keep[0]], _ae[_keep[-1] + 1])])
+    # an animation opens on its middle frame, so it can go either way from there
+    if _A != "none" and FRAME_LABELS:
+        FRAME_DEFAULT = (len(FRAME_LABELS) - 1) // 2
     # nothing to draw at all: say why rather than show an empty chart
     EMPTY_MSG = (
         f"No {sport.value.lower()} activity in this period has **{DIMS[_A].lower()}** data to animate by: widen the period or animate by something else."
@@ -1858,6 +1914,10 @@ def curve(
     # what the dot cloud reads: every activity's curve, how activities fall into frames, and the frames kept
     CLOUD_IN = None if (AXES_CLASH or not FRAMES.height or _join is None) else {
         "per": _per, "env": MONOTONE, "join": _join, "frames": _frame_tbl, "kept": _kept,
+        # and the frontier's: how activities fall into frames, the route, the bounds each line and band band adds
+        "kind": FRAME_KIND, "win": _win, "scan": SCAN, "filters": _filters,
+        "lband": {_nm: _band_filter(_g, _b[0], _b[1]) for _nm, _b in _lbands} if (SCAN and _g in _ENGINE) else None,
+        "aband": [_band_filter(_A, _b[1][0], _b[1][1]) for _b in _abands] if _abands else None,
     }
     _T3 = time.time()
     CURVE_TIMING = {"route": "scan" if SCAN else "stored", "scan_s": _scan_s,
@@ -1911,6 +1971,7 @@ def curve(
         SERIES_COLORS = ["#1f4e9c"] * max(_n_series, 1)
     return (
         AXES_CLASH,
+        BAND_KIND,
         CLASH_MSG,
         CLOUD_IN,
         EMPTY_MSG,
@@ -1962,7 +2023,11 @@ def frame_curve(FRAMES, SERIES_ORDER, SERIES_Q, acts, lines_by, pct, stat):
 
 @app.cell(hide_code=True)
 def cloud(
+    ACT_EFFORTS,
     CLOUD_IN,
+    DISPLAY_DIST,
+    DISPLAY_TIME,
+    EFFORT_RAW,
     FRAME_LABELS,
     SERIES_ORDER,
     acts,
@@ -1972,20 +2037,30 @@ def cloud(
     q,
     x_axis,
 ):
-    # The dot cloud: a principled few of the efforts behind the curve, one dot each, for the frame on screen.
-    # - Strongest length: every activity once, at the length where it ranks highest among the frame's activities. The rank
+    # The dot cloud: a principled few of the efforts behind the curve, one dot each, for the frame on screen. On a
+    # duration or distance chart the candidates are the activities' own efforts (each activity's curve split into the
+    # stretches that hold it, as the Best is), judged at their full length, where each dot sits; on a value axis, every
+    # activity's point at every x.
+    # - Best per activity: every activity once, at the length where it ranks highest among the frame's activities. The rank
     #   counts over n + 1, so topping a handful of activities counts for less than topping many.
     # - Records as set: each effort that beat every earlier one in the frame at its length, at the time, once there are
-    #   at least 3 earlier ones to beat (the first few efforts of a frame are always records).
-    # - Near the best: efforts within 3 % of the frame's Best at their length (the Best itself is the line).
+    #   at least 3 earlier ones to beat (the first few efforts of a frame are always records). On a duration or distance
+    #   chart, a segment over the lengths it set a record for (a run of them; an effort can set more than one).
+    # - Near the best: efforts within 3 % of the frame's Best at their length (the Best itself is the line); on a duration
+    #   or distance chart, a segment over the lengths it stays that close.
     # Computed from the same per-activity curves as the frames, so the dots follow the filters, the lines and the frames.
     CLOUD, CLOUD_NAMES, CLOUD_WHY, CLOUD_NOTE, CLOUD_TIMING = None, None, "''", "", None
     _mode = dot_cloud.value
     if _mode != "none" and CLOUD_IN is not None and CLOUD_IN["per"].height:
         _ci = CLOUD_IN
         _T = time.time()
-        con.register("cloud_per0", _ci["per"].select("series", "fb", "activity_id", "xb", "d", "y", "t_start", "src0").to_arrow())
-        if _ci["env"]:
+        _eff = ACT_EFFORTS is not None and ACT_EFFORTS.height > 0
+        if _eff:
+            con.register("cloud_per0", EFFORT_RAW.select("series", "fb", "activity_id", pl.col("xb").cast(pl.Int64), "d", "y", "t_start", pl.col("xb").cast(pl.Int64).alias("src0")).to_arrow())
+            con.register("cloud_eff", ACT_EFFORTS.select("series", "fb", "activity_id", pl.col("len").cast(pl.Int64).alias("xb"), "from_len", "t0").to_arrow())
+        else:
+            con.register("cloud_per0", _ci["per"].select("series", "fb", "activity_id", "xb", "d", "y", "t_start", "src0").to_arrow())
+        if _eff or _ci["env"]:
             # each activity's best at a length is the best held for at least that long, as the curve counts it
             _ysql = "max(y) over w as y, arg_max(t_start, y) over w as t_start, arg_max(src0, y) over w as src_xb"
             _wsql = "window w as (partition by series, fb, activity_id order by xb desc rows between unbounded preceding and current row)"
@@ -2004,16 +2079,26 @@ def cloud(
             con.register("cloud_series", pl.DataFrame({"series": SERIES_ORDER, "s": list(range(len(SERIES_ORDER)))}).to_arrow())
             _ssql, _sjoin = "sm.s", "join cloud_series sm on sm.series = p.series"
         _b = f"""
-            select fr.f::int as f, {_ssql}::int as s, p.activity_id, p.xb::int as xb, p.d, p.y, p.t_start::int as t, p.src_xb::int as src
+            select fr.f::int as f, {_ssql}::int as s, p.series, p.fb, p.activity_id, p.xb::int as xb, p.d, p.y, p.t_start::int as t, p.src_xb::int as src
             from cloud_env p {_join} {_sjoin}
         """
+        # the candidates: each activity's efforts at their full length (Best per activity), or every length an effort holds
+        # on its activity's own curve (records and near-best, judged along it: a segment)
+        _seg = _eff and _mode in ("records", "near")
+        _on_eff = "e.series = r.series and e.fb = r.fb and e.activity_id = r.activity_id"
+        _cand = (
+            f"select r.*, e.from_len, e.t0 as et0, e.xb as elen from r join cloud_eff e on {_on_eff} and r.xb <= e.xb and (e.from_len is null or r.xb > e.from_len)" if _seg
+            else f"select r.*, e.from_len, e.t0 as et0, e.xb as elen from r join cloud_eff e on {_on_eff} and e.xb = r.xb" if _eff
+            else "select r.*, null::double as from_len, r.t as et0, r.xb as elen from r"
+        )
         _sql = {
             "strong": f"""
                 with b as ({_b}), r as (
                     select *, count(*) over w as n, rank() over (partition by f, s, xb order by y) as rk, y / nullif(median(y) over w, 0) as rel
                     from b window w as (partition by f, s, xb)
                 )
-                select *, n - rk + 1 as pos, rk / (n + 1.0) as score from r where n >= 3
+                , x as ({_cand})
+                select *, n - rk + 1 as pos, rk / (n + 1.0) as score from x where n >= 3
                 qualify row_number() over (partition by f, s, activity_id order by rk / (n + 1.0) desc, rel desc nulls last, xb) = 1
             """,
             "records": f"""
@@ -2021,14 +2106,15 @@ def cloud(
                     select *, max(y) over e as prev, count(*) over e as earlier, y / nullif(max(y) over (partition by f, s, xb), 0) as keep
                     from b window e as (partition by f, s, xb order by d, activity_id rows between unbounded preceding and 1 preceding)
                 )
-                select *, (y - prev) / nullif(abs(prev), 0) as score from r where earlier >= 3 and y > prev
+                , x as ({_cand})
+                select *, (y - prev) / nullif(abs(prev), 0) as score from x where earlier >= 3 and y > prev
             """,
             "near": f"""
                 with b as ({_b}), r as (
                     select *, max(y) over w as best, count(*) over w as n from b window w as (partition by f, s, xb)
                 )
                 select *, (best - y) / nullif(abs(best), 0) as gap, -(best - y) / nullif(abs(best), 0) as score
-                from r where n >= 3 and y < best and y >= best - 0.03 * abs(best)
+                from ({_cand}) x where n >= 3 and y < best and y >= best - 0.03 * abs(best)
             """,
         }[_mode]
         _c = q(_sql)
@@ -2036,9 +2122,34 @@ def cloud(
         if _ci["kept"] is not None:
             _map = {old: new for new, old in enumerate(_ci["kept"])}
             _c = _c.filter(pl.col("f").is_in(list(_map))).with_columns(f=pl.col("f").replace_strict(_map, return_dtype=pl.Int32))
+        if _seg and _c.height:
+            # runs of consecutive grid lengths per effort: each is one segment (lo to hi), summed up by its best point
+            _gi = {int(x): i for i, x in enumerate(sorted(set(EFFORT_RAW["xb"].cast(pl.Int64).to_list())))}
+            _grp = ["f", "s", "activity_id", "et0", "run"]
+            _c = (
+                _c.with_columns(gi=pl.col("xb").cast(pl.Int64).replace_strict(_gi, return_dtype=pl.Int64))
+                .sort("f", "s", "activity_id", "et0", "xb")
+                .with_columns(run=pl.col("gi") - pl.int_range(pl.len()).over(["f", "s", "activity_id", "et0"]))
+                .with_columns(lo=pl.col("xb").min().over(_grp), hi=pl.col("xb").max().over(_grp),
+                              kseg=(pl.col("score").max() if _mode == "records" else pl.col("gap").min()).over(_grp))
+            )
+            # drawn at the chart's own lengths (and each segment's two ends): finer points would only add weight
+            _disp = {int(v) for v in (DISPLAY_TIME if x_axis.value == "len_time" else DISPLAY_DIST)} if x_axis.value in ("len_time", "len_dist") else None
+            _c = _c if _disp is None else _c.filter(pl.col("xb").cast(pl.Int64).is_in(list(_disp)) | (pl.col("xb") == pl.col("lo")) | (pl.col("xb") == pl.col("hi")))
         # bounded: the chart carries every frame's dots, so past this many each frame keeps its most notable ones
         _MAX = 15_000
-        if _c.height > _MAX:
+        if _seg and _c.height > _MAX:
+            # whole segments, the most notable of each frame first (records nearest the Best, efforts nearest it)
+            _per_f = max(20, _MAX // max(len(FRAME_LABELS), 1))
+            _sc = (pl.col("keep").max() if _mode == "records" else -pl.col("gap").min()).alias("sc")
+            _keep = (
+                _c.group_by(_grp).agg(pl.len().alias("n"), _sc).sort("f", "sc", descending=[False, True])
+                .with_columns(cum=pl.col("n").cum_sum().over("f"))
+                .filter((pl.col("cum") <= _per_f) | (pl.col("cum") == pl.col("n")))
+            )
+            _c = _c.join(_keep.select(_grp), on=_grp, how="semi")
+            CLOUD_NOTE = f"the most notable segments of each frame"
+        elif _c.height > _MAX:
             _per_f = max(20, _MAX // max(len(FRAME_LABELS), 1))
             # most notable: the strongest ranks, the records nearest the frame's Best, the efforts nearest it
             _c = _c.sort("keep" if "keep" in _c.columns else "score", descending=True, nulls_last=True).group_by("f", maintain_order=True).head(_per_f)
@@ -2048,18 +2159,31 @@ def cloud(
         _here = "length" if x_axis.value in ("len_time", "len_dist") else "point"
         _k = {
             "strong": (pl.col("pos"), pl.col("n")),
+            "seg": ((pl.col("kseg") * 100).round(1), pl.lit(0)),
             "records": ((pl.col("score") * 100).round(1), pl.lit(0)),
             "near": ((pl.col("gap") * 100).round(1), pl.lit(0)),
-        }[_mode]
+        }["seg" if _seg else _mode]
+        # a segment's lengths, {LO} and {HI}, are put in the chart's own length labels by the chart
+        _span = "(datum.lo == datum.hi ? 'at ' + {LO} : {LO} + ' to ' + {HI})"
         CLOUD_WHY = {
-            "strong": f"'Strongest {_here}: #' + datum.k1 + ' of ' + datum.k2 + ' here'",
+            "seg_records": f"'Records when set, ' + {_span} + ': up to ' + format(datum.k1, '.1f') + '% past the earlier best'",
+            "seg_near": f"'Within 3% of the Best, ' + {_span} + ': ' + format(datum.k1, '.1f') + '% off at its closest'",
+            "strong": f"'This activity’s best {_here}: #' + datum.k1 + ' of ' + datum.k2 + ' here'",
             "records": "'Record when set: ' + format(datum.k1, '.1f') + '% past the earlier best'",
             "near": "format(datum.k1, '.1f') + '% off the Best'",
-        }[_mode]
+        }[f"seg_{_mode}" if _seg else _mode]
         CLOUD = _c.select(
-            pl.col("f").cast(pl.Int32), pl.col("s").cast(pl.Int32), pl.col("xb").cast(pl.Int64), pl.col("y").round(4),
-            "activity_id", "t", "src", _k[0].alias("k1"), _k[1].alias("k2"),
+            pl.col("f").cast(pl.Int32), pl.col("s").cast(pl.Int32), pl.col("xb").cast(pl.Int64), pl.col("y").round(4), "activity_id",
+            # a click opens the effort's full window
+            pl.col("et0" if _eff else "t").cast(pl.Int64).alias("t"), pl.col("elen" if _eff else "src").cast(pl.Int64).alias("src"),
+            _k[0].alias("k1"), _k[1].alias("k2"), pl.col("from_len").cast(pl.Float64),
+            *([pl.col("run").cast(pl.Int32), pl.col("lo").cast(pl.Int64), pl.col("hi").cast(pl.Int64)] if _seg else []),
         )
+        if _seg:
+            # where a segment is drawn: its lengths, and a one-length segment as a short pill (a second point just past it)
+            _one = CLOUD.filter(pl.col("lo") == pl.col("hi"))
+            CLOUD = pl.concat([CLOUD.with_columns(xd=pl.col("xb").cast(pl.Float64)),
+                               _one.with_columns(xd=pl.col("xb").cast(pl.Float64) * 1.006)])
         CLOUD_NAMES = acts.filter(pl.col("activity_id").is_in(CLOUD["activity_id"].unique().to_list())).select(
             "activity_id", "name", pl.col("date").dt.strftime("%b %d, %Y").alias("date")
         )
@@ -2068,13 +2192,344 @@ def cloud(
 
 
 @app.cell(hide_code=True)
+def efforts(
+    BAND_KIND,
+    CLOUD_IN,
+    DISPLAY_DIST,
+    DISPLAY_TIME,
+    FRAMES,
+    FRAME_LABELS,
+    SERIES_ORDER,
+    con,
+    cur_table,
+    filters,
+    length,
+    lines_by,
+    q,
+    scanner,
+    stat,
+    x_axis,
+    y_axis,
+):
+    import bisect
+
+    # The Best as efforts: the stretches of activities that hold it, each over the range of lengths it holds (from the
+    # previous effort's full length up to its own longest window). The engine finds them from the per-activity grid and
+    # makes every handoff exact to the second or metre, by evaluating, between grid lengths, the activities that could
+    # matter there. One frontier per frame and line, on duration and distance axes, for the Best (Lines: None, or each
+    # line's Best).
+    _E_SCHEMA = {"f": pl.Int32, "s": pl.Int32, "e": pl.Int32, "aid": pl.Int64, "t0": pl.Int64, "len": pl.Float64,
+                 "y": pl.Float64, "from_len": pl.Float64, "from_y": pl.Float64}
+    EFFORTS = pl.DataFrame(schema=_E_SCHEMA)
+    EFFORT_PTS = pl.DataFrame(schema={"f": pl.Int32, "s": pl.Int32, "e": pl.Int32, "o": pl.Int32, "x": pl.Float64, "y": pl.Float64})
+    EFFORT_TIMING = None
+    # each activity's own efforts (its own curve split the same way), for the dot cloud, and the per-activity grid
+    ACT_EFFORTS, EFFORT_RAW = None, None
+    EFFORT_LINE = EFFORT_BARS = EFFORT_CAPS = None
+    _ci = CLOUD_IN
+    _len_axis = x_axis.value in ("len_time", "len_dist")
+    # time or distance into as x: the engine's dimension, engine units per display unit (min, mi), the cloud's grid step
+    INTO = {"tb": ("t0", 60.0, 1.0), "db": ("d0", 1609.344, 0.1), "hb": ("h", 1.0, 1.0)}
+    _into = x_axis.value in INTO and bool(BAND_KIND.get(x_axis.value))
+    _want_best = lines_by.value == "none" or stat.value == "Best"
+    if _ci is not None and (_len_axis or _into):
+        if _into:
+            # Time into an activity as x: for windows of the Window control's length, the best among those starting at
+            # least T in. The engine reads it from every start of every activity (exact, no grid), as a staircase of
+            # efforts; x is in display units here (minutes, miles).
+            _T = time.time()
+            _bw, _nw = length.value
+            _ym = y_axis.value
+            _P = scanner()
+            _index = {int(a): i for i, a in enumerate(_P.activity_ids)}
+            _sidx = {n: i for i, n in enumerate(SERIES_ORDER)} if lines_by.value != "none" else None
+            _kept = {old: new for new, old in enumerate(_ci["kept"])} if _ci["kept"] is not None else None
+            _epoch = dt.date(1970, 1, 1)
+            _dim, _u, _step = INTO[x_axis.value]
+            # a smaller-is-harder dimension (heart rate) is mirrored here (u = -x), so the hard end is always the high end
+            _sg = -1.0 if BAND_KIND.get(x_axis.value) == "at_most" else 1.0
+            _dirn = "le" if _sg < 0 else "ge"
+            _x0, _x1 = (float(v) for v in filters.value[x_axis.value])
+            _ua, _ub = sorted((_sg * _x0, _sg * _x1))
+            _grid = np.arange(np.floor(_ua / _step), np.ceil(_ub / _step) + 1)  # the cloud's grid, in steps
+            _out, _verts, _own, _rawp = [], [], [], []
+            for (_series, _fb), _cell in _ci["per"].select("series", "fb", "activity_id", "d").unique().partition_by(["series", "fb"], as_dict=True).items():
+                _s = 0 if _sidx is None else _sidx.get(_series)
+                _ids = sorted(a for a in _cell["activity_id"].unique().to_list() if a in _index)
+                if _s is None or not _ids:
+                    continue
+                _row = {a: i for i, a in enumerate(_ids)}
+                _day = dict(zip(_cell["activity_id"].to_list(), _cell["d"].to_list()))
+                _kind = _ci["kind"]
+                if _kind == "window":
+                    _fs = list(range(_ci["frames"].height))
+                    _sets = [[_row[a] for a in _ids if e - _ci["win"] < _day[a] <= e] for e in _ci["frames"]["e"].to_list()]
+                elif _kind == "year":
+                    _fs = list(range(_ci["frames"].height))
+                    _sets = [[_row[a] for a in _ids if (_epoch + dt.timedelta(days=int(_day[a]))).year == yr] for yr in _ci["frames"]["yr"].to_list()]
+                else:
+                    _fs = [int(_fb) if _kind == "band" else 0]
+                    _sets = [list(range(len(_ids)))]
+                _sets = [st if (_kept is None or f in _kept) else [] for f, st in zip(_fs, _sets)]
+                # the view's filters, and starts within the axis's range (the time-into slider), as the bins hold them
+                _flt = list(_ci["filters"]) + [(_dim, _x0 * _u, _x1 * _u)]
+                if _ci["lband"] is not None and _series in _ci["lband"]:
+                    _flt.append(_ci["lband"][_series])
+                if _kind == "band" and _ci["aband"] is not None and int(_fb) < len(_ci["aband"]):
+                    _flt.append(_ci["aband"][int(_fb)])
+                _pidx = np.array([_index[a] for a in _ids], dtype=np.int64)
+                # each activity's own staircase (its own efforts, and its own frontier on the cloud's grid): the cloud's
+                # candidates and the field they are ranked in
+                _oe, _op = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, [[i] for i in range(len(_ids))], filters=_flt, direction=_dirn)
+                if len(_oe["set"]):
+                    _own.append(pl.DataFrame({
+                        "series": [_series] * len(_oe["set"]), "fb": [int(_fb)] * len(_oe["set"]), "activity_id": [_ids[int(r)] for r in _oe["row"]],
+                        "len": np.floor(_sg * _oe["x"] / _u / _step), "t0": _oe["t0"].astype(np.int64),
+                        "from_len": np.floor(_sg * _oe["from_x"] / _u / _step),
+                    }, schema_overrides={"series": pl.String, "fb": pl.Int32}).with_columns(pl.col("from_len").fill_nan(None)))
+                    for _si in range(len(_ids)):
+                        _m = _op["set"] == _si
+                        _px, _py = _sg * _op["x"][_m] / _u, _op["y"][_m]
+                        if not len(_px):
+                            continue
+                        # F at each grid x: the first staircase point at or after it (windows starting at least x in)
+                        _j = np.searchsorted(_px, _grid * _step, side="left")
+                        _ok = _j < len(_px)
+                        _rawp.append(pl.DataFrame({
+                            "series": [_series] * int(_ok.sum()), "fb": [int(_fb)] * int(_ok.sum()), "activity_id": [_ids[_si]] * int(_ok.sum()),
+                            "xb": _grid[_ok], "d": [_day[_ids[_si]]] * int(_ok.sum()), "y": _py[_j[_ok]].astype(np.float64),
+                            "t_start": (_px[_j[_ok]] * (_u if _dim == "t0" else 0)).astype(np.int64),
+                        }, schema_overrides={"series": pl.String, "fb": pl.Int32}))
+                if not _want_best:
+                    continue
+                _e, _p = _P.frontier_into(_bw, float(_nw), _ym, _dim, _pidx, _sets, filters=_flt, direction=_dirn)
+                if not len(_e["set"]):
+                    continue
+                _fmap = lambda si: (_kept[_fs[si]] if _kept is not None else _fs[si])
+                _out.append(pl.DataFrame({
+                    "f": [_fmap(int(si)) for si in _e["set"]], "s": [_s] * len(_e["set"]), "e": _e["effort"],
+                    "aid": [_ids[int(r)] for r in _e["row"]], "t0": _e["t0"], "len": _sg * _e["x"] / _u, "y": _e["y"],
+                    "from_len": _sg * _e["from_x"] / _u, "from_y": _e["from_y"],
+                }).cast(_E_SCHEMA).with_columns([pl.col(c).fill_nan(None) for c in ("y", "from_len", "from_y")]))
+                # the staircase as drawn: F(T) holds each point's value from the previous point up to it; points closer
+                # than a pixel column merge (an effort's last point always stays)
+                _P_ = pl.DataFrame({"si": _p["set"], "e": _p["effort"], "x": _sg * _p["x"] / _u, "y": _p["y"]})
+                for (_si,), _g in _P_.partition_by(["si"], as_dict=True).items():
+                    _rows = _g.rows()
+                    _dx = max((_rows[-1][2] - _ua) / 900.0, 1e-9)
+                    _last_of = {}
+                    for _k, _r in enumerate(_rows):
+                        _last_of[_r[1]] = _k
+                    _keep, _lx = [], None
+                    for _k, _r in enumerate(_rows):
+                        if _lx is None or _r[2] - _lx >= _dx or _last_of[_r[1]] == _k:
+                            _keep.append(_r)
+                            _lx = _r[2]
+                    _f, _o, _px = _fmap(int(_si)), 0, _ua
+                    for (_, _ee, _xx, _yy) in _keep:
+                        _verts += [(_f, _s, int(_ee), _o, _px, _yy), (_f, _s, int(_ee), _o + 1, _xx, _yy)]
+                        _o, _px = _o + 2, _xx
+            ACT_EFFORTS = pl.concat(_own) if _own else None
+            EFFORT_RAW = pl.concat(_rawp) if _rawp else None
+            if _out:
+                EFFORTS = pl.concat(_out).sort("f", "s", "len")
+                EFFORT_PTS = pl.DataFrame(_verts, schema={"f": pl.Int32, "s": pl.Int32, "e": pl.Int32, "o": pl.Int32, "x": pl.Float64, "y": pl.Float64}, orient="row")
+        else:
+            _T = time.time()
+            _basis = "time" if x_axis.value == "len_time" else "dist"
+            _ym = y_axis.value
+            _P = scanner()
+            _index = {int(a): i for i, a in enumerate(_P.activity_ids)}
+            _lo = float((DISPLAY_TIME if _basis == "time" else DISPLAY_DIST)[0])
+            if _ci["scan"]:
+                # the scan's own per-activity values (at the chart's lengths, every start, with the view's filters)
+                _raw = _ci["per"].select("series", "fb", "activity_id", pl.col("xb").cast(pl.Float64), "d", "y", "t_start")
+            else:
+                # the stored curves: every start, at every stored length
+                con.register("ef_sel", _ci["per"].select("series", "activity_id", "d").unique().to_arrow())
+                _raw = q(f"""
+                    select s.series, 0::int as fb, c.activity_id, c.len::double as xb, s.d, c.{_ym}::double as y, c.t_{_ym}::bigint as t_start
+                    from {cur_table} c join ef_sel s using (activity_id)
+                    where c.basis = '{_basis}' and c.{_ym} is not null and c.len >= {_lo}
+                """)
+            _raw = _raw.filter(pl.col("activity_id").is_in(list(_index)) & pl.col("y").is_not_nan() & (pl.col("xb") >= _lo))
+            _grid = np.array(sorted(set(_raw["xb"].to_list())), dtype=np.float64)
+            _sidx = {n: i for i, n in enumerate(SERIES_ORDER)} if lines_by.value != "none" else None
+            _kept = {old: new for new, old in enumerate(_ci["kept"])} if _ci["kept"] is not None else None
+            _epoch = dt.date(1970, 1, 1)
+            _out, _own = [], []
+            for (_series, _fb), _cell in _raw.partition_by(["series", "fb"], as_dict=True).items():
+                _s = 0 if _sidx is None else _sidx.get(_series)
+                if _s is None or not _cell.height:
+                    continue
+                _ids = sorted(_cell["activity_id"].unique().to_list())
+                _row = {a: i for i, a in enumerate(_ids)}
+                _Y = np.full((len(_ids), 1, len(_grid)), np.nan, dtype=np.float32)
+                _T0 = np.full((len(_ids), 1, len(_grid)), -1, dtype=np.int32)
+                _ri = np.array([_row[a] for a in _cell["activity_id"].to_list()], dtype=np.int64)
+                _ki = np.searchsorted(_grid, _cell["xb"].to_numpy())
+                _Y[_ri, 0, _ki] = _cell["y"].to_numpy()
+                _T0[_ri, 0, _ki] = _cell["t_start"].to_numpy()
+                _day = dict(zip(_cell["activity_id"].to_list(), _cell["d"].to_list()))
+                # the frames this line runs through, each a set of rows (a band animation's frame is the cell's band)
+                _kind = _ci["kind"]
+                if _kind == "window":
+                    _fs = list(range(_ci["frames"].height))
+                    _sets = [[_row[a] for a in _ids if e - _ci["win"] < _day[a] <= e] for e in _ci["frames"]["e"].to_list()]
+                elif _kind == "year":
+                    _fs = list(range(_ci["frames"].height))
+                    _sets = [[_row[a] for a in _ids if (_epoch + dt.timedelta(days=int(_day[a]))).year == yr] for yr in _ci["frames"]["yr"].to_list()]
+                else:
+                    _fs = [int(_fb) if _kind == "band" else 0]
+                    _sets = [list(range(len(_ids)))]
+                # frames the chart skips (too thin) need no frontier
+                _sets = [st if (_kept is None or f in _kept) else [] for f, st in zip(_fs, _sets)]
+                # the cell's own bounds, so the exact windows obey them: the view's filters, its line band, its frame's band
+                _flt = list(_ci["filters"])
+                if _ci["lband"] is not None and _series in _ci["lband"]:
+                    _flt.append(_ci["lband"][_series])
+                if _kind == "band" and _ci["aband"] is not None and int(_fb) < len(_ci["aband"]):
+                    _flt.append(_ci["aband"][int(_fb)])
+                _pidx = np.array([_index[a] for a in _ids], dtype=np.int64)
+                _o = _P.frontier(_basis, _ym, _grid, _Y, _T0, _pidx, [[i] for i in range(len(_ids))], refine=False)
+                _own.append(pl.DataFrame({
+                    "series": [_series] * len(_o["row"]), "fb": [int(_fb)] * len(_o["row"]), "activity_id": [_ids[int(r)] for r in _o["row"]],
+                    "len": _o["len"], "t0": _o["t0"].astype(np.int64), "from_len": _o["from_len"],
+                }, schema_overrides={"series": pl.String, "fb": pl.Int32}).with_columns(pl.col("from_len").fill_nan(None)))
+                if not _want_best:
+                    continue
+                _r = _P.frontier(_basis, _ym, _grid, _Y, _T0, _pidx, _sets, filters=_flt)
+                if not len(_r["set"]):
+                    continue
+                _f_old = np.array(_fs)[_r["set"]]
+                _out.append(pl.DataFrame({
+                    "f": [(_kept[int(f)] if _kept is not None else int(f)) for f in _f_old], "s": [_s] * len(_f_old), "e": _r["effort"],
+                    "aid": [_ids[int(r)] for r in _r["row"]], "t0": _r["t0"], "len": _r["len"], "y": _r["y"],
+                    "from_len": _r["from_len"], "from_y": _r["from_y"],
+                }).cast(_E_SCHEMA).with_columns([pl.col(c).fill_nan(None) for c in ("y", "from_len", "from_y")]))
+            EFFORT_RAW = _raw
+            ACT_EFFORTS = pl.concat(_own) if _own else None
+            if _out:
+                EFFORTS = pl.concat(_out).sort("f", "s", "len")
+                # each effort's bar: from its handoff to its full length, through the Best line's points between
+                _best = FRAMES.filter(pl.col("best").is_not_null()).select(
+                    pl.col("f").cast(pl.Int32), pl.col("s").cast(pl.Int32), pl.col("xb").cast(pl.Float64).alias("x"), pl.col("best").cast(pl.Float64).alias("y")
+                ).sort("x")
+                _owner = _best.join_asof(EFFORTS.select("f", "s", "e", "len", "from_len").sort("len"), left_on="x", right_on="len", by=["f", "s"], strategy="forward", check_sortedness=False)
+                _inner = _owner.filter(pl.col("e").is_not_null() & (pl.col("from_len").is_null() | (pl.col("x") > pl.col("from_len"))) & (pl.col("x") < pl.col("len")))
+                EFFORT_PTS = pl.concat([
+                    _inner.select("f", "s", "e", "x", "y"),
+                    EFFORTS.select("f", "s", "e", pl.col("len").alias("x"), "y"),
+                    EFFORTS.filter(pl.col("from_len").is_not_null()).select("f", "s", "e", pl.col("from_len").alias("x"), pl.col("from_y").alias("y")),
+                ]).filter(pl.col("y").is_not_null()).sort("f", "s", "e", "x").with_columns(o=pl.int_range(pl.len()).over(["f", "s", "e"]).cast(pl.Int32)).select("f", "s", "e", "o", "x", "y")
+        EFFORT_TIMING = round(time.time() - _T, 2)
+        # Between two frames the chart blends them (the frame is fractional while it moves). The efforts' line, bars and dots
+        # are laid out for each pair of neighbouring frames (p, p + 1; the last frame paired with itself):
+        # - the line: both frames' exact Best sampled at every point either has (both sides of each drop), so the browser blends
+        #   them point by point, and at a whole frame it is that frame's line exactly;
+        # - an effort that continues from one frame to the next (same activity, overlapping window) keeps one id: its bar's ends
+        #   and its dot glide (on the log scale), the others fade out or in.
+        EFFORT_LINE = pl.DataFrame(schema={"p": pl.Int32, "s": pl.Int32, "o": pl.Int32, "x": pl.Float64, "sd": pl.Int8, "ya": pl.Float64, "yb": pl.Float64})
+        EFFORT_BARS = pl.DataFrame(schema={"p": pl.Int32, "s": pl.Int32, "bid": pl.Int32, "o": pl.Int32, "x": pl.Float64, "sd": pl.Int8, "ya": pl.Float64, "yb": pl.Float64})
+        EFFORT_CAPS = pl.DataFrame()
+        if EFFORTS.height:
+            _F = len(FRAME_LABELS)
+            _poly = {k: [(r[0], r[1]) for r in v.select("x", "y").rows()] for k, v in EFFORT_PTS.sort("f", "s", "e", "o").partition_by(["f", "s"], as_dict=True).items()}
+            _eff = {k: v.sort("len").rows(named=True) for k, v in EFFORTS.partition_by(["f", "s"], as_dict=True).items()}
+            _series = sorted({k[1] for k in _eff})
+
+            def _at(v, x, sd):
+                """A frame's line at x (sd 0: from the left, 1: from the right of a drop), straight on the log scale (on a
+                value axis, linear); None outside."""
+                if not v or x < v[0][0] or x > v[-1][0]:
+                    return None
+                _xs = [p[0] for p in v]
+                _i, _j = bisect.bisect_left(_xs, x), bisect.bisect_right(_xs, x)
+                if _i < _j:
+                    return v[_i][1] if sd == 0 else v[_j - 1][1]
+                (_x0, _y0), (_x1, _y1) = v[_i - 1], v[_i]
+                if not _len_axis:
+                    return _y0 + (_y1 - _y0) * (x - _x0) / (_x1 - _x0)
+                return _y0 + (_y1 - _y0) * (np.log(x) - np.log(_x0)) / (np.log(_x1) - np.log(_x0))
+
+            def _span(r):
+                """The time an effort covers (s into its activity), for matching it across frames."""
+                if _into:
+                    # the window of the Window control's length (by distance: at its pace)
+                    _dur = length.value[1] if length.value[0] == "time" else length.value[1] / max(r["y"] if y_axis.value in ("v", "x") else 3.0, 0.5)
+                else:
+                    _dur = r["len"] if x_axis.value == "len_time" else r["len"] / max(r["y"] if y_axis.value in ("v", "x") else 3.0, 0.5)
+                return r["t0"], r["t0"] + _dur
+
+            # one id per effort that continues across frames
+            _bid, _nb = {}, 0
+            for _s in _series:
+                _prev = []
+                for _f in range(_F):
+                    _cur, _used = _eff.get((_f, _s), []), set()
+                    for _r in _cur:
+                        _a0, _a1 = _span(_r)
+                        _m = next((q for q in _prev if q["aid"] == _r["aid"] and id(q) not in _used and _span(q)[0] < _a1 and _span(q)[1] > _a0), None)
+                        if _m is not None:
+                            _used.add(id(_m))
+                            _bid[(_f, _s, _r["e"])] = _bid[(_m["f"], _s, _m["e"])]
+                        else:
+                            _bid[(_f, _s, _r["e"])] = _nb
+                            _nb += 1
+                    _prev = _cur
+            _lines, _bars, _caps = [], [], []
+            for _p in range(_F):
+                _q = min(_p + 1, _F - 1)
+                for _s in _series:
+                    _va, _vb = _poly.get((_p, _s), []), _poly.get((_q, _s), [])
+                    if not (_va or _vb):
+                        continue
+                    _xa, _xb = [p[0] for p in _va], [p[0] for p in _vb]
+                    _drops = {x for x in set(_xa) if _xa.count(x) > 1} | {x for x in set(_xb) if _xb.count(x) > 1}
+                    _rows = []
+                    for _x in sorted(set(_xa) | set(_xb)):
+                        for _sd in ((0, 1) if _x in _drops else (0,)):
+                            _rows.append((_x, _sd, _at(_va, _x, _sd), _at(_vb, _x, _sd)))
+                    _lines += [(_p, _s, _o, x, sd, ya, yb) for _o, (x, sd, ya, yb) in enumerate(_rows)]
+                    # each effort of either frame: its range in each (lo exclusive, hi inclusive; lo 0 for the first)
+                    _side = {}
+                    for _k, _fr in (("a", _p), ("b", _q)):
+                        for _r in _eff.get((_fr, _s), []):
+                            _b = _bid[(_fr, _s, _r["e"])]
+                            _side.setdefault(_b, {})[_k] = _r
+                    for _b, _sd2 in _side.items():
+                        _ra, _rb = _sd2.get("a"), _sd2.get("b")
+                        _lo = min((r["from_len"] if r["from_len"] is not None else -np.inf) for r in (_ra, _rb) if r is not None)
+                        _hi = max(r["len"] for r in (_ra, _rb) if r is not None)
+                        _bars += [(_p, _s, _b, _o, x, sd, ya, yb) for _o, (x, sd, ya, yb) in enumerate(_rows) if _lo <= x <= _hi]
+                        _g = lambda r, k, d=None: (r[k] if (r is not None and r[k] is not None) else d)
+                        _caps.append({
+                            "p": _p, "q": _q, "s": _s, "bid": _b, "ina": _ra is not None, "inb": _rb is not None,
+                            **{f"{k}_{n}": _g(r, k, None) for n, r in (("a", _ra), ("b", _rb)) for k in ("aid", "t0", "len", "y", "from_len")},
+                        })
+            EFFORT_LINE = pl.DataFrame(_lines, schema=EFFORT_LINE.schema, orient="row")
+            EFFORT_BARS = pl.DataFrame(_bars, schema=EFFORT_BARS.schema, orient="row")
+            EFFORT_CAPS = pl.DataFrame(_caps, infer_schema_length=None)
+    return (
+        ACT_EFFORTS,
+        EFFORTS,
+        EFFORT_BARS,
+        EFFORT_CAPS,
+        EFFORT_LINE,
+        EFFORT_RAW,
+    )
+
+
+@app.cell(hide_code=True)
 def curve_now(
     CHART_GEN,
+    EFFORTS,
     FRAMES,
     FRAME_DEFAULT,
     FRAME_LABELS,
     FRAME_NOW,
     PICK_GEN,
+    SERIES_ORDER,
     frame_curve,
     get_frame,
     lines_by,
@@ -2090,8 +2545,15 @@ def curve_now(
     # else close it, so the panel never shows an activity the chart does not
     _pk = PICK_GEN.get("pick")
     if _pk is not None and PICK_GEN.get("gen") == CHART_GEN and PICK_GEN.get("frame") not in (None, FRAME_I):
+        _s = SERIES_ORDER.index(_pk[0]) if (lines_by.value != "none" and _pk[0] in SERIES_ORDER) else 0
+        _eff = EFFORTS.filter((pl.col("f") == FRAME_I) & (pl.col("s") == _s) & (pl.col("aid") == _pk[2])) if len(_pk) == 5 else EFFORTS.head(0)
         _mine = FRAMES.filter((pl.col("f") == FRAME_I) & (pl.col("aid") == _pk[2])) if (len(_pk) == 5 and lines_by.value == "none") else FRAMES.head(0)
-        if _mine.height:
+        if _eff.height:
+            _m = _eff.with_columns(_d=pl.when(pl.col("t0") == _pk[3]).then(-1.0).otherwise((pl.col("len") - _pk[1]).abs())).sort("_d").row(0, named=True)
+            _keep = ("Best" if _pk[0] == "Cloud" else _pk[0], int(round(_m["len"])), int(_m["aid"]), int(_m["t0"]), int(round(_m["len"])))
+            PICK_GEN.update(pick=_keep, frame=FRAME_I)
+            set_pick(_keep)
+        elif not EFFORTS.height and _mine.height:
             _m = _mine.with_columns(_d=(pl.col("xb") - _pk[1]).abs()).sort("_d").row(0, named=True)
             _keep = ("Best", int(_m["xb"]), int(_m["aid"]), int(_m["t"]), int(_m["src"]))
             PICK_GEN.update(pick=_keep, frame=FRAME_I)
@@ -2358,12 +2820,18 @@ def chart(
 
 @app.cell(hide_code=True)
 def client_chart(
+    ACT_EFFORTS,
     AXES_CLASH,
+    BAND_KIND,
     CADENCE_UNIT,
     CLOUD,
     CLOUD_NAMES,
     CLOUD_WHY,
     DIMS,
+    EFFORTS,
+    EFFORT_BARS,
+    EFFORT_CAPS,
+    EFFORT_LINE,
     FRAMES,
     FRAME_ACTS,
     FRAME_DEFAULT,
@@ -2379,6 +2847,8 @@ def client_chart(
     acts,
     animate_by,
     dot_cloud,
+    fmt_len,
+    length,
     lines_by,
     pct,
     sport,
@@ -2440,9 +2910,19 @@ def client_chart(
                    if _basis == "time" else "datum.xb < 1000 ? datum.xb + ' m' : format(datum.xb / 1000, '.2f') + ' km'")
         else:
             _w = {"gb": 1, "pb": 20, "hb": 5, "cb": 5}.get(_x)
-            if _x == "vb":
+            if _x in ("tb", "db"):
+                # a bin (5 min, half a mile) holds windows starting at least its start in
+                _bw_ = 5.0 if _x == "tb" else 0.5
+                _xcalc = f"datum.xb * {_bw_}"
+                _xpy = lambda b: b * _bw_
+            elif _x == "vb":
                 _xcalc = "(datum.xb + 0.5) * 0.2 * 2.23694" if _speedy else "26.8224 / ((datum.xb + 0.5) * 0.2)"
                 _xpy = (lambda b: (b + 0.5) * 0.2 * 2.23694) if _speedy else (lambda b: 26.8224 / ((b + 0.5) * 0.2))
+            elif BAND_KIND.get(_x) == "at_most":
+                # a bin holds windows at most its top (heart rate)
+                _bw_ = float(_w)
+                _xcalc = f"(datum.xb + 1) * {_w}"
+                _xpy = lambda b: (b + 1) * _w
             else:
                 _xcalc = f"(datum.xb + 0.5) * {_w}"
                 _xpy = lambda b: (b + 0.5) * _w
@@ -2452,13 +2932,22 @@ def client_chart(
                 _xv = [_xpy(_d.min()), _xpy(_d.max())] if _d.len() else [_xpy(r["xb"].min()), _xpy(r["xb"].max())]
                 if _x == "vb" and not _speedy:
                     _xv = [min(_xv), min(max(_xv), 30.0)]  # paces slower than 30:00 /mi are walking breaks
+                if BAND_KIND.get(_x) and EFFORTS.height:
+                    # out to the Best's hardest effort (efforts are stored on the hard-is-high scale)
+                    _ev = [_sgn * float(v) for v in EFFORTS["len"]]
+                    _xv = [min(min(_xv), min(_ev) - _bw_ / 2), max(max(_xv), max(_ev) + _bw_ / 2)]
                 return sorted(float(v) for v in _xv)
-            _xtitle = {"gb": "Gradient (%)", "pb": "Power (W)", "hb": "Heart rate (bpm)", "cb": f"Cadence ({CADENCE_UNIT[sport.value]})",
+            _xtitle = {"tb": "Time into activity (min)", "db": "Distance into activity (mi)", "gb": "Gradient (%)", "pb": "Power (W)", "hb": "Heart rate (bpm)", "cb": f"Cadence ({CADENCE_UNIT[sport.value]})",
                        "vb": "Speed (mph)" if _speedy else "Pace (min/mi)"}[_x]
             _X = lambda dom: alt.X("x:Q", title=_xtitle, scale=alt.Scale(domain=dom, nice=False, zero=False),
                        axis=alt.Axis(labelExpr=_pace_expr) if (_x == "vb" and not _speedy) else alt.Undefined)
-            _xl = f"format({_xcalc}, ',.1f')" if not (_x == "vb" and not _speedy) else _lab(_xcalc)
+            _xl = (f"format({_xcalc}, ',.0f') + ' min in'" if _x == "tb" else f"format({_xcalc}, ',.1f') + ' mi in'" if _x == "db"
+                   else f"'≤ ' + format({_xcalc}, ',.0f') + ' bpm'" if BAND_KIND.get(_x) == "at_most"
+                   else f"format({_xcalc}, ',.1f')" if not (_x == "vb" and not _speedy) else _lab(_xcalc))
 
+        _xname = ("Duration" if _x == "len_time" else "Distance") if _len_axis else _xtitle.split(" (")[0]
+        # efforts on a smaller-is-harder axis (heart rate) are stored mirrored (u = -x): flip them back for drawing
+        _sgn = -1 if BAND_KIND.get(_x) == "at_most" else 1
         # y: one range for every frame (from frames with 3+ activities, trimmed), so motion on screen means change
         _yt = {"p": "Power (W)", "g": "Gradient (%)", "h": "Heart rate (bpm)", "a": "Vertical speed (ft/h)", "v": "Speed (mph)" if _speedy else "Pace (min/mi)",
                "c": f"Cadence ({CADENCE_UNIT[sport.value]})", "k": "Torque (N·m)", "l": "Step length (in)"}[_k]
@@ -2536,13 +3025,19 @@ def client_chart(
                 return []
             _sn = "[" + ", ".join(json.dumps(n) for n in SERIES_ORDER) + "][datum.s]" if SERIES_ORDER else "''"
             _fr = "(frame - 100000)"
-            _key = "'' + datum.activity_id" if dot_cloud.value == "strong" else "datum.activity_id + ':' + datum.xb"
+            # segments (records, near-best on a length axis) are drawn through their lengths; dots at one
+            _seg = "run" in CLOUD.columns
+            _ig = {"tb": (1.0, " min in", ",.0f"), "db": (0.1, " mi in", ",.1f"), "hb": (1.0, " bpm", ",.0f")}.get(_x) if (ACT_EFFORTS is not None and ACT_EFFORTS.height) else None
+            _cxc = f"{_sgn} * datum.xb * {_ig[0]}" if _ig else _xcalc
+            _cxl = f"format(abs(datum.xb) * {_ig[0]}, '{_ig[2]}') + '{_ig[1]}'" if _ig else _xl
+            _key = ("datum.activity_id + ':' + datum.t + ':' + datum.xd" if _seg else "'' + datum.activity_id" if dot_cloud.value == "strong"
+                    else "datum.activity_id + ':' + datum.t + ':' + datum.xb")
             # x moves on the axis's own scale: log for durations and distances
             _lx, _ux = ("log(datum.x)", "exp(datum.sx / datum.sw)") if _len_axis else ("datum.x", "datum.sx / datum.sw")
             _cc = (
                 alt.Chart(CLOUD)
                 .transform_filter(f"datum.f == floor({_fr}) || datum.f == floor({_fr}) + 1")
-                .transform_calculate(x=_xcalc, yv=_yv("datum.y"), key=_key,
+                .transform_calculate(x=(f"{_sgn} * datum.xd * {_ig[0]}" if _ig else "datum.xd") if _seg else _cxc, yv=_yv("datum.y"), key=_key,
                                      w=f"datum.f == floor({_fr}) ? 1 - ({_fr} - floor({_fr})) : {_fr} - floor({_fr})")
                 .transform_calculate(wx=f"datum.w * {_lx}", wy="datum.w * datum.yv")
                 .transform_aggregate(sw="sum(w)", sx="sum(wx)", sy="sum(wy)", near="argmax(w)", groupby=["key"])
@@ -2550,18 +3045,37 @@ def client_chart(
                 .transform_calculate(
                     x=_ux, yv="datum.sy / datum.sw", op="0.3 * datum.sw",
                     f="datum.near.f", s="datum.near.s", xb="datum.near.xb", y="datum.near.y", activity_id="datum.near.activity_id",
-                    t="datum.near.t", src="datum.near.src", k1="datum.near.k1", k2="datum.near.k2",
+                    t="datum.near.t", src="datum.near.src", k1="datum.near.k1", k2="datum.near.k2", from_len="datum.near.from_len",
+                    **({"run": "datum.near.run", "lo": "datum.near.lo", "hi": "datum.near.hi", "xd": "datum.near.xd"} if _seg else {}),
                 )
                 .transform_calculate(
-                    series="'Cloud'", sname=_sn, ylab=_lab(_yv("datum.y")), xl=_xl,
-                    on="'c:' + datum.f + ':' + datum.xb + ':' + datum.activity_id == kpick", why=CLOUD_WHY,
+                    series="'Cloud'", sname=_sn, ylab=_lab(_yv("datum.y")), xl=_cxl,
+                    # the lengths the effort is its activity's own best for: up to its full window
+                    own=f"isValid(datum.from_len) ? ({_cxl.replace('datum.xb', 'datum.from_len')}) + ' to ' + ({_cxl.replace('datum.xb', 'datum.src')}) : 'up to ' + ({_cxl.replace('datum.xb', 'datum.src')})",
+                    # a segment lights up whole when the effort on show is a point of it
+                    on=("split(kpick, ':')[0] == 'c' && toNumber(split(kpick, ':')[1]) == datum.f && toNumber(split(kpick, ':')[3]) == datum.activity_id"
+                        " && toNumber(split(kpick, ':')[2]) >= datum.lo && toNumber(split(kpick, ':')[2]) <= datum.hi") if _seg
+                       else "'c:' + datum.f + ':' + datum.xb + ':' + datum.activity_id == kpick",
+                    why=CLOUD_WHY.replace("{LO}", f"({_cxl.replace('datum.xb', 'datum.lo')})").replace("{HI}", f"({_cxl.replace('datum.xb', 'datum.hi')})"),
+                    segkey="datum.activity_id + ':' + datum.t + ':' + datum.run",
                 )
                 .transform_lookup(lookup="activity_id", from_=alt.LookupData(CLOUD_NAMES, "activity_id", ["name", "date"]))
             )
-            _cpick = alt.selection_point(name="cpick", on="click", fields=["series", "xb", "activity_id", "t", "src", "f"], empty=False)
             _tips = [alt.Tooltip("name:N", title="Activity"), alt.Tooltip("date:N", title="Date"), alt.Tooltip("xl:N", title="At"),
                      alt.Tooltip("ylab:N", title="Value"), alt.Tooltip("why:N", title="Why")]
+            if ACT_EFFORTS is not None and ACT_EFFORTS.height:
+                _tips.append(alt.Tooltip("own:N", title="Its own best"))
             _on = "datum.on"
+            if _seg:
+                return [
+                    _cc.mark_line(clip=True, strokeWidth=4, strokeCap="round", strokeJoin="round").encode(
+                        x=_X, y=_Y("yv"), detail="segkey:N", order="xd:Q",
+                        color=alt.condition(_on, alt.value("#f97316"), color if color is not None else alt.value("#334155")),
+                        opacity=alt.condition(_on, alt.value(0.95), alt.Opacity("op:Q", scale=None)),
+                        # a segment's own words (its span is in Why); one point's length and value would mislead
+                        tooltip=[t for t in _tips if t.to_dict().get("field") not in ("xl", "ylab")],
+                    ).add_params(_pick)
+                ]
             return [
                 _cc.mark_circle(clip=True, strokeWidth=1.5).encode(
                     x=_X, y=_Y("yv"),
@@ -2570,7 +3084,94 @@ def client_chart(
                     size=alt.condition(_on, alt.value(110), alt.value(22)),
                     stroke=alt.condition(_on, alt.value("white"), alt.value(None)),
                     tooltip=_tips,
-                ).add_params(_cpick)
+                ).add_params(_pick)
+            ]
+
+        def _effort_layers(color, line_color):
+            """The Best as efforts: a thick translucent bar along the line over the lengths each holds (two alternating
+            shades), its full window as a dot at the bar's end. Hovering a bar raises all of it; clicking it opens the
+            drill-down on that effort's full window, which then shows in orange with a crosshair. Between two frames the
+            line blends, a continuing effort's bar and dot glide, and the others fade."""
+            if EFFORT_CAPS is None or not EFFORT_CAPS.height:
+                return []
+            _fr = "(frame - 100000)"
+            _w = f"({_fr} - floor({_fr}))"
+            _pf = f"datum.p == floor({_fr})"
+            _sn = "[" + ", ".join(json.dumps(n) for n in SERIES_ORDER) + "][datum.s]" if (SERIES_ORDER and not _none) else "'Best'"
+            _iu = {"tb": (" min", ",.0f"), "db": (" mi", ",.1f"), "hb": (" bpm", ",.0f")}.get(_x) if BAND_KIND.get(_x) else None
+            _lenlab = (lambda e: f"format(abs({e}), '{_iu[1]}') + '{_iu[0]}'") if _iu else (lambda e: _xl.replace("datum.xb", e))
+            _lerp = f"isValid(datum.ya) && isValid(datum.yb) ? datum.ya + (datum.yb - datum.ya) * {_w} : isValid(datum.ya) ? ({_w} < 0.5 ? datum.ya : null) : ({_w} >= 0.5 ? datum.yb : null)"
+            # on the log scale; exact at a whole frame, where a bar's ends must meet the line's points
+            _glog = ((lambda a, b: f"({_w} == 0 ? {a} : exp(log({a}) + (log({b}) - log({a})) * {_w}))") if _len_axis
+                     else (lambda a, b: f"({a} + ({b} - {a}) * {_w})"))
+            # the effort's attributes on the nearer frame (or the only one it is in)
+            _near = {
+                "na": f"datum.ina && ({_w} < 0.5 || !datum.inb)",
+                "aid": "datum.na ? datum.aid_a : datum.aid_b", "t0": "datum.na ? datum.t0_a : datum.t0_b", "elen": "datum.na ? datum.len_a : datum.len_b",
+                "ey": "datum.na ? datum.y_a : datum.y_b", "efrom": "datum.na ? datum.from_len_a : datum.from_len_b", "nf": "datum.na ? datum.p : datum.q",
+                "op": f"(datum.ina ? 1 - {_w} : 0) + (datum.inb ? {_w} : 0)",
+            }
+            _ident = {
+                "series": _sn, "sname": _sn, "activity_id": "datum.aid", "t": "datum.t0", "src": "round(datum.elen)", "xb": "round(datum.elen)", "f": "datum.nf",
+                "on": "'e:' + datum.nf + ':' + datum.s + ':' + datum.aid + ':' + datum.t0 == kpick",
+                "full": (f"'{fmt_len(*length.value)} at ' + ({_lab(_yv('datum.ey'))}) + ', at ' + ({_lenlab('datum.elen')})" if (_iu and _sgn < 0)
+                         else f"'{fmt_len(*length.value)} at ' + ({_lab(_yv('datum.ey'))}) + ', starting ' + ({_lenlab('datum.elen')}) + ' in'" if _iu
+                         else f"({_lenlab('datum.elen')}) + ' at ' + ({_lab(_yv('datum.ey'))})"),
+                "holds": (f"isValid(datum.efrom) && datum.efrom != 0 ? 'from ' + format(abs(datum.elen), '{_iu[1]}') + ' to ' + ({_lenlab('datum.efrom')}) : 'from ' + ({_lenlab('datum.elen')}) + ' up'" if (_iu and _sgn < 0)
+                          else f"isValid(datum.efrom) ? 'from ' + format(datum.efrom, '{_iu[1]}') + ' to ' + ({_lenlab('datum.elen')}) + ' in' : 'up to ' + ({_lenlab('datum.elen')}) + ' in'" if _iu
+                          else f"isValid(datum.efrom) ? ({_lenlab('datum.efrom')}) + ' to ' + ({_lenlab('datum.elen')}) : 'up to ' + ({_lenlab('datum.elen')})"),
+            }
+            _caps_v = EFFORT_CAPS.with_columns(ckey=pl.format("{}:{}:{}", "p", "s", "bid")).join(
+                acts.select(pl.col("activity_id").alias("aid_n"), "name", pl.col("date").dt.strftime("%b %d, %Y").alias("date")),
+                left_on=pl.coalesce("aid_a", "aid_b"), right_on="aid_n", how="left",
+            )
+            _cols = [c for c in _caps_v.columns if c not in ("p", "s", "bid", "ckey")]
+            _ehov = alt.selection_point(name="ehov", on="pointerover", clear="pointerout", fields=["ckey"], empty=False)
+            _bars = (
+                alt.Chart(EFFORT_BARS).transform_filter(_pf)
+                .transform_calculate(ckey="datum.p + ':' + datum.s + ':' + datum.bid")
+                .transform_lookup(lookup="ckey", from_=alt.LookupData(_caps_v, "ckey", _cols))
+                .transform_calculate(**_near)
+                .transform_calculate(
+                    lo=f"datum.ina && datum.inb && isValid(datum.from_len_a) && isValid(datum.from_len_b) ? {_glog('datum.from_len_a', 'datum.from_len_b')} : datum.na ? datum.from_len_a : datum.from_len_b",
+                    hi=f"datum.ina && datum.inb ? {_glog('datum.len_a', 'datum.len_b')} : datum.na ? datum.len_a : datum.len_b",
+                    yr=_lerp,
+                )
+                .transform_filter("(!isValid(datum.lo) || datum.x > datum.lo || (datum.x == datum.lo && datum.sd == 1)) && (datum.x < datum.hi || (datum.x == datum.hi && datum.sd == 0))")
+                .transform_calculate(yv=_yv("datum.yr"), **_ident)
+                .transform_calculate(x=f"{_sgn} * datum.x")
+                .transform_calculate(bop="datum.op * (datum.on ? 0.45 : datum.bid % 2 ? 0.16 : 0.3)")
+            )
+            _tips = [alt.Tooltip("name:N", title="Activity"), alt.Tooltip("date:N", title="Date"), alt.Tooltip("full:N", title="Full window"),
+                     alt.Tooltip("holds:N", title="Holds the Best")]
+            if not _none:
+                _tips.insert(0, alt.Tooltip("sname:N", title=LEGEND_TITLE or "Line"))
+            _caps = (
+                alt.Chart(_caps_v).transform_filter(_pf).transform_calculate(**_near)
+                .transform_calculate(
+                    x=f"{_sgn} * (datum.ina && datum.inb ? {_glog('datum.len_a', 'datum.len_b')} : datum.na ? datum.len_a : datum.len_b)",
+                    yr=f"datum.ina && datum.inb ? datum.y_a + (datum.y_b - datum.y_a) * {_w} : datum.na ? datum.y_a : datum.y_b",
+                )
+                .transform_calculate(yv=_yv("datum.yr"), **_ident)
+            )
+            _line = alt.Chart(EFFORT_LINE).transform_filter(_pf).transform_calculate(yr=_lerp).transform_filter("isValid(datum.yr)").transform_calculate(yv=_yv("datum.yr"), sname=_sn, x=f"{_sgn} * datum.x")
+            _hair = dict(color="#f97316", strokeWidth=1, strokeDash=[3, 3], opacity=0.45)
+            _focus = _caps.transform_filter(f"datum.on && {_w} < 0.5")
+            return [
+                # the line and the dots under the bars, so a click on either reaches its bar
+                _line.mark_line(strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv"), order="o:Q", detail="s:N", color=line_color),
+                _caps.mark_circle(size=42, clip=True).encode(x=_X, y=_Y("yv"), color=color if color is not None else alt.value("#08306b"),
+                                                             opacity=alt.Opacity("op:Q", scale=None)),
+                _bars.mark_line(strokeWidth=9, strokeCap="round", strokeJoin="round", clip=True).encode(
+                    x=_X, y=_Y("yv"), detail="ckey:N", order="o:Q",
+                    color=alt.condition("datum.on", alt.value("#f97316"), color if color is not None else alt.value("#1f4e9c")),
+                    opacity=alt.condition(_ehov, alt.value(0.55), alt.Opacity("bop:Q", scale=None)),
+                    tooltip=_tips,
+                ).add_params(_pick, _ehov),
+                # the effort on show in the drill-down: a crosshair to both axes and a ring at its full window
+                _focus.mark_rule(**_hair).encode(x=_X),
+                _focus.mark_rule(**_hair).encode(y=_Y("yv")),
+                _focus.mark_circle(size=320, filled=False, stroke="#f97316", strokeWidth=3).encode(x=_X, y=_Y("yv")),
             ]
 
         if _none:
@@ -2593,7 +3194,7 @@ def client_chart(
                 _layers.append(_stats.mark_line(color="#9e9e9e", strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv")))
             # off the Best points, hovering anywhere shows every statistic at that x
             _tcalc = {"xl": _xl, "t_best": _lab(_yv("datum.best"))}
-            _tips = [alt.Tooltip("xl:N", title=_X.title if isinstance(_X.title, str) else "x"), alt.Tooltip("t_best:N", title="Best")]
+            _tips = [alt.Tooltip("xl:N", title=_xname), alt.Tooltip("t_best:N", title="Best")]
             for _p in sorted(_inner, reverse=True):
                 _tcalc[f"t_{_qn(_p)}"] = _lab(_yv(f"datum.{_qn(_p)}"))
                 _tips.append(alt.Tooltip(f"t_{_qn(_p)}:N", title="Median" if _p == 50 else "Lowest" if _p == 0 else f"p{_p:g}"))
@@ -2607,16 +3208,20 @@ def client_chart(
                 _base.transform_calculate(activity_id="datum.aid", yv=_yv("datum.best"), series="'Best'", ylab=_lab(_yv("datum.best")))
                 .transform_lookup(lookup="aid", from_=alt.LookupData(_names, "aid", ["name", "date"]))
             )
-            _layers.append(_best.mark_line(color="#08306b", strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv")))
-            _layers.append(_best.mark_circle(size=36, color="#08306b", clip=True).encode(
-                x=_X, y=_Y("yv"), tooltip=[alt.Tooltip("name:N", title="Activity"), alt.Tooltip("date:N", title="Date"), alt.Tooltip("ylab:N", title="Best")]
-            ).add_params(_pick))
-            # the focused effort: a subtle crosshair to both axes, under its ring
-            _focus = _best.transform_filter("datum.f * 100000 + datum.xb == kpick")
-            _hair = dict(color="#f97316", strokeWidth=1, strokeDash=[3, 3], opacity=0.45)
-            _layers.append(_focus.mark_rule(**_hair).encode(x=_X))
-            _layers.append(_focus.mark_rule(**_hair).encode(y=_Y("yv")))
-            _layers.append(_focus.mark_circle(size=320, filled=False, stroke="#f97316", strokeWidth=3).encode(x=_X, y=_Y("yv")))
+            _ef = _effort_layers(None, alt.value("#08306b"))
+            if _ef:
+                _layers += _ef
+            else:
+                _layers.append(_best.mark_line(color="#08306b", strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv")))
+                # no efforts (a value axis): the Best's points, clickable as before
+                _layers.append(_best.mark_circle(size=36, color="#08306b", clip=True).encode(
+                    x=_X, y=_Y("yv"), tooltip=[alt.Tooltip("name:N", title="Activity"), alt.Tooltip("date:N", title="Date"), alt.Tooltip("ylab:N", title="Best")]
+                ).add_params(_pick))
+                _focus = _best.transform_filter("datum.f * 100000 + datum.xb == kpick")
+                _hair = dict(color="#f97316", strokeWidth=1, strokeDash=[3, 3], opacity=0.45)
+                _layers.append(_focus.mark_rule(**_hair).encode(x=_X))
+                _layers.append(_focus.mark_rule(**_hair).encode(y=_Y("yv")))
+                _layers.append(_focus.mark_circle(size=320, filled=False, stroke="#f97316", strokeWidth=3).encode(x=_X, y=_Y("yv")))
         else:
             # one line per series, coloured as the lines mean (years, bands, periods)
             _sname = "[" + ", ".join(json.dumps(n) for n in SERIES_ORDER) + "][datum.s]"
@@ -2625,14 +3230,19 @@ def client_chart(
             _lines = _base.transform_filter("datum.n >= 3" if _vcol != "best" else "true").transform_calculate(
                 series=_sname, yv=_yv(f"datum.{_vcol}"), activity_id="datum.aid" if _vcol == "best" else "null", ylab=_lab(_yv(f"datum.{_vcol}"))
             )
-            _layers.append(_lines.mark_line(strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv"), color=_color, detail="series:N"))
+            _escale = alt.Scale(domain=SERIES_ORDER, range=SERIES_COLORS[:len(SERIES_ORDER)] or ["#1f4e9c"])
+            _ef = _effort_layers(alt.Color("sname:N", scale=_escale, legend=None),
+                                 alt.Color("sname:N", scale=_escale, legend=alt.Legend(title=LEGEND_TITLE, orient="top"))) if _vcol == "best" else []
+            if not _ef:
+                _layers.append(_lines.mark_line(strokeWidth=2.2, clip=True).encode(x=_X, y=_Y("yv"), color=_color, detail="series:N"))
             # hovering anywhere shows every line's value at that x
             _wide = _lines.transform_calculate(sk="'s' + datum.s").transform_pivot("sk", value="ylab", groupby=["xb", "x"]).transform_calculate(xl=_xl)
-            _tips = [alt.Tooltip("xl:N", title="x")] + [alt.Tooltip(f"s{i}:N", title=n) for i, n in enumerate(SERIES_ORDER)]
+            _tips = [alt.Tooltip("xl:N", title=_xname)] + [alt.Tooltip(f"s{i}:N", title=n) for i, n in enumerate(SERIES_ORDER)]
             _layers.append(_wide.mark_point(opacity=0).encode(x=_X).add_params(_xhov))
             _layers.append(_wide.mark_rule(color="#94a3b8", strokeWidth=1).encode(x=_X, tooltip=_tips).transform_filter(_xhov))
             _layers += _cloud_layers(alt.Color("sname:N", scale=alt.Scale(domain=SERIES_ORDER, range=SERIES_COLORS[:len(SERIES_ORDER)] or ["#1f4e9c"]), legend=None))
-            if _vcol == "best":
+            _layers += _ef
+            if _vcol == "best" and not _ef:
                 _lb = _lines.transform_lookup(lookup="aid", from_=alt.LookupData(_names, "aid", ["name", "date"]))
                 _layers.append(_lb.mark_circle(size=30, clip=True).encode(
                     x=_X, y=_Y("yv"), color=_color,
@@ -2735,59 +3345,68 @@ def chart_view(
 
 @app.cell(hide_code=True)
 def key_nav(
+    BAND_KIND,
     CHART_GEN,
+    EFFORTS,
     FRAMES,
     FRAME_DEFAULT,
     FRAME_NOW,
     PICK_GEN,
+    SERIES_ORDER,
     lines_by,
     set_pick,
+    x_axis,
 ):
-    # Left and right arrows: the previous or next point along the Best line of the frame on screen (Lines: None), with or
-    # without an animation (up and down move the frames, in the page). The page reports the key here
+    # Left and right arrows: the previous or next effort along the Best of the frame on screen (on a value axis, the next
+    # point of the Best line with Lines: None), with or without an animation (up and down move the frames, in the page). The page reports the key here
     # ("next:<point on screen>:<nonce>", the point as frame * 100000 + length, a cloud dot as c:frame:length:activity, -1
     # for none; a cloud dot steps from its length); the pick
     # moves from the point on screen (not from a pick still on its way there) to the neighbouring dot, whichever activity
     # set it, and the drill-down follows.
     def _step(v):
         _dir = v.split(":")[0]
-        if _dir not in ("next", "prev") or lines_by.value != "none" or not FRAMES.height:
+        if BAND_KIND.get(x_axis.value) == "at_most" and EFFORTS.height:
+            _dir = {"next": "prev", "prev": "next"}.get(_dir, _dir)
+        if _dir not in ("next", "prev"):
             return
         _fr = FRAME_NOW["i"] if FRAME_NOW["i"] is not None else FRAME_DEFAULT
-        _best = FRAMES.filter((pl.col("f") == _fr) & pl.col("aid").is_not_null()).sort("xb")
-        if not _best.height:
-            return
-        _rows = _best.rows(named=True)
-        _parts = v.split(":")
-        _sp = _parts[1:-1]
-        _shown = int(_sp[0]) if len(_sp) == 1 and _sp[0].lstrip("-").isdigit() else -1
-        _cur = None
-        if len(_sp) == 4 and _sp[0] == "c" and _sp[1].isdigit() and int(_sp[1]) == _fr and _sp[2].isdigit():
-            # from a cloud dot: the nearest Best points either side of its length
-            _xb = int(_sp[2])
-            _nxt = [i for i, r in enumerate(_rows) if (r["xb"] > _xb if _dir == "next" else r["xb"] < _xb)]
-            if not _nxt:
-                return
-            _r = _rows[_nxt[0] if _dir == "next" else _nxt[-1]]
-            _new = ("Best", int(_r["xb"]), int(_r["aid"]), int(_r["t"]), int(_r["src"]))
-            PICK_GEN.update(gen=CHART_GEN, pick=_new, frame=_fr)
-            set_pick(_new)
-            return
-        if _shown >= 0 and _shown // 100000 == _fr:
-            _row = next((r for r in _rows if r["xb"] == _shown % 100000), None)
-            _cur = None if _row is None else ("Best", _row["xb"], _row["aid"], _row["t"], _row["src"])
-        if _cur is None:
-            _i = 0 if _dir == "next" else len(_rows) - 1
+        _pk = PICK_GEN.get("pick") if PICK_GEN.get("gen") == CHART_GEN else None
+        _sp = v.split(":")[1:-1]
+        if EFFORTS.height:
+            # efforts: the line of the effort on show (the first line when none is)
+            _s = SERIES_ORDER.index(_pk[0]) if (lines_by.value != "none" and _pk and _pk[0] in SERIES_ORDER) else 0
+            _rows = EFFORTS.filter((pl.col("f") == _fr) & (pl.col("s") == _s)).sort("len").rows(named=True)
+            _name = SERIES_ORDER[_s] if lines_by.value != "none" else "Best"
+            _key = lambda r: (_name, int(round(r["len"])), int(r["aid"]), int(r["t0"]), int(round(r["len"])))
+            _len = lambda r: r["len"]
+            _at = None
+            if len(_sp) == 5 and _sp[0] == "e" and _sp[1].isdigit() and int(_sp[1]) == _fr:
+                _at = next((i for i, r in enumerate(_rows) if r["aid"] == int(_sp[3]) and r["t0"] == int(_sp[4])), None)
         else:
-            _at = next((i for i, r in enumerate(_rows) if r["xb"] == _cur[1]), None)
-            if _at is None:
-                _i = 0 if _dir == "next" else len(_rows) - 1
-            else:
-                _i = _at + (1 if _dir == "next" else -1)
-                if not 0 <= _i < len(_rows):
-                    return  # already at the end of the curve that way
-        _r = _rows[_i]
-        _new = ("Best", int(_r["xb"]), int(_r["aid"]), int(_r["t"]), int(_r["src"]))
+            if lines_by.value != "none" or not FRAMES.height:
+                return
+            _rows = FRAMES.filter((pl.col("f") == _fr) & pl.col("aid").is_not_null()).sort("xb").rows(named=True)
+            _key = lambda r: ("Best", int(r["xb"]), int(r["aid"]), int(r["t"]), int(r["src"]))
+            _len = lambda r: r["xb"]
+            _at = None
+            if len(_sp) == 1 and _sp[0].isdigit() and int(_sp[0]) // 100000 == _fr:
+                _at = next((i for i, r in enumerate(_rows) if r["xb"] == int(_sp[0]) % 100000), None)
+        if not _rows:
+            return
+        if _at is not None:
+            _i = _at + (1 if _dir == "next" else -1)
+        elif len(_sp) == 4 and _sp[0] == "c" and _sp[1].isdigit() and int(_sp[1]) == _fr and _sp[2].isdigit():
+            # from a cloud dot: the nearest one either side of its length
+            _x = int(_sp[2])
+            _side = [i for i, r in enumerate(_rows) if (_len(r) > _x if _dir == "next" else _len(r) < _x)]
+            if not _side:
+                return
+            _i = _side[0] if _dir == "next" else _side[-1]
+        else:
+            _i = 0 if _dir == "next" else len(_rows) - 1
+        if not 0 <= _i < len(_rows):
+            return  # already at the end that way
+        _new = _key(_rows[_i])
         PICK_GEN.update(gen=CHART_GEN, pick=_new, frame=_fr)
         set_pick(_new)
 
@@ -2944,10 +3563,12 @@ def drill(
     CHART_GEN,
     DASH,
     DRILL_CACHE,
+    EFFORTS,
     FRAME_I,
     HAS_STRAVA,
     HRQ,
     PICK_GEN,
+    SERIES_ORDER,
     SPEED_SPORT,
     acts,
     curve,
@@ -2955,6 +3576,7 @@ def drill(
     fmt_len,
     get_pick,
     length,
+    lines_by,
     q,
     set_pick,
     sport,
@@ -3057,7 +3679,10 @@ def drill(
             """)
             if _sv.height:
                 _links.append(f'<a href="https://www.strava.com/activities/{_sv["id"][0]}" target="_blank" rel="noopener">Strava ↗</a>')
-        _pm = f"c:{FRAME_I}:{int(_r['xb'])}:{int(_r['activity_id'])}" if _r["series"] == "Cloud" else FRAME_I * 100000 + int(_r["xb"])
+        _si = SERIES_ORDER.index(_r["series"]) if (lines_by.value != "none" and _r["series"] in SERIES_ORDER) else 0
+        _pm = (f"c:{FRAME_I}:{int(_r['xb'])}:{int(_r['activity_id'])}" if _r["series"] == "Cloud"
+               else f"e:{FRAME_I}:{_si}:{int(_r['activity_id'])}:{int(_r['t_start'])}" if EFFORTS.height
+               else FRAME_I * 100000 + int(_r["xb"]))
         _pick_mark = f'<span hidden data-pick="{_pm}"></span>'
         _header = mo.md(_pick_mark + f"**{_act['name']}** · {_act['date']:%A, %B %d, %Y} · " + " · ".join(f for f in _facts if f) + " · " + " · ".join(_links))
 
