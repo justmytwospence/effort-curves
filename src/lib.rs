@@ -304,6 +304,50 @@ impl Prepared {
         };
         Ok((y, t0))
     }
+
+    /// Time spent in each bin of one dimension: per activity, the seconds whose `length`-second window (starting at the
+    /// second) falls in edges[i] <= value < edges[i + 1] and passes `filters`. Time and distance into the activity are
+    /// the second's own. activities: indices into activity_ids (default all), in output order.
+    /// Returns float seconds shaped (activities, bins).
+    #[pyo3(signature = (dim, edges, length=30.0, filters=vec![], activities=None))]
+    fn seconds_in<'py>(
+        &self,
+        py: Python<'py>,
+        dim: &str,
+        edges: PyReadonlyArray1<'py, f64>,
+        length: f64,
+        filters: Vec<(String, f64, f64)>,
+        activities: Option<PyReadonlyArray1<'py, i64>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !(length >= 1.0) {
+            return Err(PyValueError::new_err("length must be at least 1 second"));
+        }
+        let group = parse_groups(Some((dim.to_string(), edges)), None)?.remove(0);
+        let filters = parse_filters(filters)?;
+        let n_all = self.activity_ids.len();
+        let acts: Vec<usize> = match activities {
+            Some(ix) => ix
+                .as_slice()?
+                .iter()
+                .map(|&i| {
+                    if i >= 0 && (i as usize) < n_all {
+                        Ok(i as usize)
+                    } else {
+                        Err(PyValueError::new_err(format!("activity index {i} out of range")))
+                    }
+                })
+                .collect::<PyResult<_>>()?,
+            None => (0..n_all).collect(),
+        };
+        let by_act = self.by_act();
+        let len = length as usize;
+        let rows: Vec<Vec<f64>> = py.allow_threads(|| {
+            acts.par_iter().map(|&a| compute::seconds_in(&by_act[a], len, &filters, &group, &self.sport)).collect()
+        });
+        let nb = group.n();
+        let flat: Vec<f64> = rows.into_iter().flatten().collect();
+        Ok(PyArray1::from_vec(py, flat).reshape([acts.len(), nb])?.into_any())
+    }
 }
 
 /// Build segments from raw samples of many activities, concatenated and sorted by (activity, t).

@@ -279,6 +279,40 @@ pub fn activity(
     res
 }
 
+/// Time spent: per activity, the seconds in each bin of `group`, each second counting as the `len`-second window that
+/// starts at it (its value is that window's: a heart rate or gradient over `len` seconds, the time or distance into the
+/// activity at the second itself), among windows passing `filters`. The last `len` seconds of each segment start no
+/// full window and do not count.
+pub fn seconds_in(segs: &[&Segment], len: usize, filters: &[Filter], group: &Group, sp: &Sport) -> Vec<f64> {
+    let mut out = vec![0.0; group.n()];
+    let dt = len as f64;
+    let mut w = [0.0; M];
+    for s in segs {
+        let n = s.n();
+        if len == 0 || len >= n {
+            continue;
+        }
+        'start: for i in 0..n - len {
+            let j = i + len;
+            eval(s, i, j, dt, s.cd[j] - s.cd[i], dt, Basis::Time, sp, &mut w);
+            let value = |dim: Dim| match dim {
+                Dim::Metric(m) => w[m],
+                Dim::T0 => s.t_off + i as f64,
+                Dim::D0 => s.d_off + s.cd[i],
+            };
+            for f in filters {
+                if !f.pass(value(f.dim)) {
+                    continue 'start;
+                }
+            }
+            if let Some(b) = group.bin(value(group.dim)) {
+                out[b] += 1.0;
+            }
+        }
+    }
+    out
+}
+
 /// One metric of a window, as `eval` computes it (the same arithmetic, so the values are identical).
 #[inline]
 #[allow(clippy::too_many_arguments)]
