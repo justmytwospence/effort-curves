@@ -14,11 +14,13 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 /// Prepared segments for a set of activities, ready for any number of window evaluations.
-#[pyclass(frozen)]
+#[pyclass]
 struct Prepared {
     activity_ids: Vec<i64>,
     segs: Vec<Segment>,
     sport: Sport,
+    /// the running threshold set with `set_gait` (cycles per minute), NaN when unset
+    gait: f64,
 }
 
 impl Prepared {
@@ -308,8 +310,10 @@ impl Prepared {
     /// Time spent in each bin of one dimension: per activity, the seconds whose `length`-second window (starting at the
     /// second) falls in edges[i] <= value < edges[i + 1] and passes `filters`. Time and distance into the activity are
     /// the second's own. activities: indices into activity_ids (default all), in output order.
-    /// Returns float seconds shaped (activities, bins).
-    #[pyo3(signature = (dim, edges, length=30.0, filters=vec![], activities=None))]
+    /// Returns float seconds shaped (activities, bins). by_gait: split by each second's gait (see `set_gait`), shaped
+    /// (activities, bins, 2) as [not running, running]; only seconds stepping with a known gait count.
+    #[pyo3(signature = (dim, edges, length=30.0, filters=vec![], activities=None, by_gait=false))]
+    #[allow(clippy::too_many_arguments)]
     fn seconds_in<'py>(
         &self,
         py: Python<'py>,
@@ -318,6 +322,7 @@ impl Prepared {
         length: f64,
         filters: Vec<(String, f64, f64)>,
         activities: Option<PyReadonlyArray1<'py, i64>>,
+        by_gait: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if !(length >= 1.0) {
             return Err(PyValueError::new_err("length must be at least 1 second"));
@@ -342,11 +347,73 @@ impl Prepared {
         let by_act = self.by_act();
         let len = length as usize;
         let rows: Vec<Vec<f64>> = py.allow_threads(|| {
-            acts.par_iter().map(|&a| compute::seconds_in(&by_act[a], len, &filters, &group, &self.sport)).collect()
+            acts.par_iter()
+                .map(|&a| {
+                    if by_gait {
+                        compute::seconds_in_gait(&by_act[a], len, &filters, &group, &self.sport)
+                    } else {
+                        compute::seconds_in(&by_act[a], len, &filters, &group, &self.sport)
+                    }
+                })
+                .collect()
         });
         let nb = group.n();
         let flat: Vec<f64> = rows.into_iter().flatten().collect();
+        if by_gait {
+            return Ok(PyArray1::from_vec(py, flat).reshape([acts.len(), nb, 2])?.into_any());
+        }
         Ok(PyArray1::from_vec(py, flat).reshape([acts.len(), nb])?.into_any())
+    }
+
+    /// Seconds stepping (or pedaling) at each cadence: a histogram of every second with a real cadence, binned
+    /// edges[i] <= cadence < edges[i + 1] (cycles per minute). For `gait_threshold`.
+    fn cadence_seconds<'py>(&self, py: Python<'py>, edges: PyReadonlyArray1<'py, f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let edges = edges.as_slice()?.to_vec();
+        if edges.len() < 2 || edges.windows(2).any(|w| !(w[0] < w[1])) {
+            return Err(PyValueError::new_err("edges must be at least two increasing values"));
+        }
+        let nb = edges.len() - 1;
+        let out = py.allow_threads(|| {
+            self.segs
+                .par_iter()
+                .filter(|s| !s.crev.is_empty())
+                .map(|s| {
+                    let mut h = vec![0.0; nb];
+                    for g in 0..s.n() {
+                        let (ped, rev) = if g == 0 { (s.cped[0], s.crev[0]) } else { (s.cped[g] - s.cped[g - 1], s.crev[g] - s.crev[g - 1]) };
+                        if ped < 0.5 {
+                            continue;
+                        }
+                        let c = rev * 60.0;
+                        let i = edges.partition_point(|&e| e <= c);
+                        if i > 0 && i < edges.len() {
+                            h[i - 1] += 1.0;
+                        }
+                    }
+                    h
+                })
+                .reduce(|| vec![0.0; nb], |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                    a
+                })
+        });
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Classify every second stepping as running (cadence at or above `threshold`, cycles per minute) or walking, in
+    /// bouts of at least `min_bout` seconds; windows then have the `rs` metric (running share) and `seconds_in` can
+    /// split by gait. A NaN threshold clears it.
+    #[pyo3(signature = (threshold, min_bout=10))]
+    fn set_gait(&mut self, py: Python<'_>, threshold: f64, min_bout: usize) {
+        let segs = &mut self.segs;
+        py.allow_threads(|| segs.par_iter_mut().for_each(|s| prep::set_gait(s, threshold, min_bout)));
+        self.gait = threshold;
+    }
+
+    /// The running threshold in use (cycles per minute), NaN when gait is not set.
+    #[getter]
+    fn gait(&self) -> f64 {
+        self.gait
     }
 }
 
@@ -440,7 +507,7 @@ fn prepare<'py>(
             })
             .collect()
     });
-    Ok(Prepared { activity_ids: ids, segs, sport })
+    Ok(Prepared { activity_ids: ids, segs, sport, gait: f64::NAN })
 }
 
 /// The best over a range of consecutive bins, for every position of the range: y, t0 shaped (rows, bins, rest) (a
@@ -519,10 +586,23 @@ fn range_frames<'py>(
     ))
 }
 
+/// The cadence (cycles per minute) between walking and running in a histogram of seconds per cadence bin (as from
+/// `Prepared.cadence_seconds`, possibly summed over sports): the valley between its two highest peaks at least 25 /min
+/// apart, or NaN when the recordings show a single gait.
+#[pyfunction]
+fn gait_threshold(seconds: PyReadonlyArray1<'_, f64>, edges: PyReadonlyArray1<'_, f64>) -> PyResult<f64> {
+    let (s, e) = (seconds.as_slice()?, edges.as_slice()?);
+    if e.len() != s.len() + 1 || e.windows(2).any(|w| !(w[0] < w[1])) {
+        return Err(PyValueError::new_err("edges must be increasing, one more than seconds"));
+    }
+    Ok(prep::gait_threshold(s, e))
+}
+
 #[pymodule]
 fn effort_curves(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare, m)?)?;
     m.add_function(wrap_pyfunction!(range_frames, m)?)?;
+    m.add_function(wrap_pyfunction!(gait_threshold, m)?)?;
     m.add_class::<Prepared>()?;
     m.add("METRICS", METRICS.to_vec())?;
     Ok(())

@@ -8,8 +8,9 @@ use rayon::prelude::*;
 /// p power (W), v speed (m/s), g net gradient, h heart rate (bpm), a vertical speed (m/s), x grade-adjusted speed (m/s),
 /// c cadence over the whole window (cycles/min, coasting and stops count as zero), k crank torque (N·m: work while
 /// pedaling per radian of pedal revolution, at a pedaling cadence of at least 30/min), l distance per cycle (m: step length, from distance covered while stepping), pc cadence while pedaling or stepping
-/// (cycles/min), ps share of the window spent pedaling or stepping (0-1)
-pub const METRICS: [&str; 11] = ["p", "v", "g", "h", "a", "x", "c", "k", "l", "pc", "ps"];
+/// (cycles/min), ps share of the window spent pedaling or stepping (0-1), rs share of the stepping that was running (0-1;
+/// needs `set_gait`, and stepping over at least a quarter of the window)
+pub const METRICS: [&str; 12] = ["p", "v", "g", "h", "a", "x", "c", "k", "l", "pc", "ps", "rs"];
 pub const M: usize = METRICS.len();
 const P: usize = 0;
 const V: usize = 1;
@@ -22,6 +23,7 @@ const K: usize = 7;
 const L: usize = 8;
 const PC: usize = 9;
 const PS: usize = 10;
+const RS: usize = 11;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Basis {
@@ -121,7 +123,7 @@ fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis
         f64::NAN
     };
     if s.crev.is_empty() {
-        for m in [C, K, L, PC, PS] {
+        for m in [C, K, L, PC, PS, RS] {
             out[m] = f64::NAN;
         }
     } else {
@@ -131,6 +133,8 @@ fn eval(s: &Segment, i: usize, j: usize, dt: f64, dd: f64, basis_len: f64, basis
         out[PS] = ped / dt;
         // cadence while pedaling needs enough pedaling to mean something
         out[PC] = if ped >= 5f64.max(0.25 * dt) { rev / ped * 60.0 } else { f64::NAN };
+        // running share: of the seconds stepping, those in a running bout, on the same terms
+        out[RS] = if !s.crun.is_empty() && ped >= 5f64.max(0.25 * dt) { (s.crun[j] - s.crun[i]) / ped } else { f64::NAN };
         let enough = rev >= 1.0;
         // torque: work while pedaling per radian of revolution, only at a real pedaling cadence (>= 30/min)
         out[K] = if enough && !s.cpw.is_empty() && out[PC] >= 30.0 {
@@ -284,12 +288,22 @@ pub fn activity(
 /// activity at the second itself), among windows passing `filters`. The last `len` seconds of each segment start no
 /// full window and do not count.
 pub fn seconds_in(segs: &[&Segment], len: usize, filters: &[Filter], group: &Group, sp: &Sport) -> Vec<f64> {
-    let mut out = vec![0.0; group.n()];
+    seconds_in_impl(segs, len, filters, group, sp, false)
+}
+
+/// As `seconds_in`, split by gait: only seconds stepping with a known gait count (a window's first second, i + 1), two
+/// per bin, [not running, running], bin-major.
+pub fn seconds_in_gait(segs: &[&Segment], len: usize, filters: &[Filter], group: &Group, sp: &Sport) -> Vec<f64> {
+    seconds_in_impl(segs, len, filters, group, sp, true)
+}
+
+fn seconds_in_impl(segs: &[&Segment], len: usize, filters: &[Filter], group: &Group, sp: &Sport, by_gait: bool) -> Vec<f64> {
+    let mut out = vec![0.0; group.n() * if by_gait { 2 } else { 1 }];
     let dt = len as f64;
     let mut w = [0.0; M];
     for s in segs {
         let n = s.n();
-        if len == 0 || len >= n {
+        if len == 0 || len >= n || (by_gait && s.crun.is_empty()) {
             continue;
         }
         'start: for i in 0..n - len {
@@ -306,7 +320,12 @@ pub fn seconds_in(segs: &[&Segment], len: usize, filters: &[Filter], group: &Gro
                 }
             }
             if let Some(b) = group.bin(value(group.dim)) {
-                out[b] += 1.0;
+                if !by_gait {
+                    out[b] += 1.0;
+                } else if !s.crun.is_empty() && s.cped[i + 1] - s.cped[i] > 0.5 {
+                    let r = s.crun[i + 1] - s.crun[i] > 0.5;
+                    out[2 * b + r as usize] += 1.0;
+                }
             }
         }
     }

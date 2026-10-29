@@ -79,6 +79,8 @@ pub struct Segment {
     pub cpw: Vec<f64>,
     /// cumulative distance covered while pedaling or stepping (m), for step length on the same terms
     pub cdw: Vec<f64>,
+    /// cumulative seconds stepping in a running bout (see `set_gait`); empty until gait is set, or without cadence
+    pub crun: Vec<f64>,
     pub has_alt: bool,
 }
 
@@ -87,6 +89,94 @@ impl Segment {
     pub fn n(&self) -> usize {
         self.cd.len()
     }
+}
+
+/// Gait, per second stepping: running at or above `threshold` cycles per minute, else walking. The state only changes
+/// after `min_bout` consecutive stepping seconds on the other side, and then those seconds take the new state too, so a
+/// bout starts where it really started and a few odd steps never make one. Seconds not stepping count as neither and
+/// do not interrupt a run of seconds. A NaN threshold (or no cadence) clears it.
+pub fn set_gait(s: &mut Segment, threshold: f64, min_bout: usize) {
+    if threshold.is_nan() || s.crev.is_empty() {
+        s.crun = Vec::new();
+        return;
+    }
+    let n = s.n();
+    let mut run = vec![0.0; n];
+    let mut state: Option<bool> = None;
+    let mut pend: Vec<usize> = Vec::new();
+    for g in 0..n {
+        let (ped, rev) = if g == 0 { (s.cped[0], s.crev[0]) } else { (s.cped[g] - s.cped[g - 1], s.crev[g] - s.crev[g - 1]) };
+        if ped < 0.5 {
+            continue;
+        }
+        let r = rev * 60.0 >= threshold;
+        match state {
+            None => {
+                state = Some(r);
+                run[g] = r as u8 as f64;
+            }
+            Some(st) if st == r => {
+                pend.clear();
+                run[g] = st as u8 as f64;
+            }
+            Some(st) => {
+                run[g] = st as u8 as f64;
+                pend.push(g);
+                if pend.len() >= min_bout.max(1) {
+                    for &k in &pend {
+                        run[k] = r as u8 as f64;
+                    }
+                    state = Some(r);
+                    pend.clear();
+                }
+            }
+        }
+    }
+    s.crun = cumsum(&run);
+}
+
+/// The valley between walking and running cadence: in a histogram of seconds per cadence bin (edges increasing,
+/// cycles per minute), smoothed over about 5 /min either side, the lowest point between the two highest peaks at
+/// least 25 /min apart. The lower peak must hold at least 2 % of the higher and the valley must dip below 80 % of
+/// the lower peak; otherwise there is a single gait and the answer is NaN. Returns the valley bin's centre.
+pub fn gait_threshold(seconds: &[f64], edges: &[f64]) -> f64 {
+    let n = seconds.len();
+    if n < 3 || edges.len() != n + 1 {
+        return f64::NAN;
+    }
+    let width = (edges[n] - edges[0]) / n as f64;
+    let h = ((5.0 / width).round() as usize).max(1);
+    let sm: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut s, mut w) = (0.0, 0.0);
+            for k in i.saturating_sub(h)..=(i + h).min(n - 1) {
+                let wk = (h + 1 - i.abs_diff(k)) as f64;
+                s += seconds[k] * wk;
+                w += wk;
+            }
+            s / w
+        })
+        .collect();
+    let centre = |i: usize| (edges[i] + edges[i + 1]) / 2.0;
+    let peaks: Vec<usize> = (0..n)
+        .filter(|&i| sm[i] > 0.0 && (i == 0 || sm[i] > sm[i - 1]) && (i + 1 == n || sm[i] >= sm[i + 1]))
+        .collect();
+    let Some(&p1) = peaks.iter().max_by(|&&a, &&b| sm[a].total_cmp(&sm[b])) else { return f64::NAN };
+    let Some(&p2) = peaks
+        .iter()
+        .filter(|&&p| (centre(p) - centre(p1)).abs() >= 25.0)
+        .max_by(|&&a, &&b| sm[a].total_cmp(&sm[b]))
+    else {
+        return f64::NAN;
+    };
+    let (lo, hi) = (p1.min(p2), p1.max(p2));
+    let v = (lo..=hi).min_by(|&a, &b| sm[a].total_cmp(&sm[b])).unwrap();
+    if sm[p2] < 0.02 * sm[p1] || sm[v] >= 0.8 * sm[p2] {
+        return f64::NAN;
+    }
+    // a flat valley: its middle
+    let flat: Vec<usize> = (lo..=hi).filter(|&k| sm[k] <= sm[v] * 1.000001).collect();
+    centre(flat[flat.len() / 2])
 }
 
 #[inline]
@@ -305,6 +395,7 @@ fn build_segment(
             Vec::new()
         },
         chn: cumsum(&hn),
+        crun: Vec::new(),
         ca,
         cg,
         cx,
